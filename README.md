@@ -1,18 +1,185 @@
 # MiLTuX
-Remember Multics?
-Multics came in 1964. It was too big, with bells and whistles.
-Then Unix came in 1969 as a KISS, amputated version of Multics.
-Then Linux in 1991, which was just another version of Unix, but copyleft.
-Now you get it, huh?
-Miltux is to Multics what Linux is to Unix.
+
+Remember Multics?  
+Multics came in 1964. It was too big, with bells and whistles.  
+Then Unix came in 1969 as a KISS, amputated version of Multics.  
+Then Linux in 1991, which was just another version of Unix, but copyleft.  
+Now you get it, huh?  
+**MiLTuX is to Multics what Linux is to Unix.**
+
+A free, open-source reimplementation of the core ideas that made Multics great —
+rings of protection, ACLs on every object, and the hierarchical file system —
+running on any POSIX operating system, written in portable C99.
+
+---
 
 ## Does it work?
-No.
+
+Yes — at least the fundamentals do.  
+See [Building](#building) and try it yourself.
+
 ## Do you have time to work on it?
-No.
+
+Not really. See [TODO](TODO.md).
+
 ## Do you think this is a good idea?
-No. A good idea is to go play outside, not to spend days and nights vibe-coding something that should have been built in 1972.
+
+No. A good idea is to go play outside, not to spend days and nights
+vibe-coding something that should have been built in 1972.
+
 ## Who are you, you who think you can do better than millions of coders?
-I am William Gacquer, the Messiah, but you are not obliged to believe (it). Sometimes I joke.
+
+I am William Gacquer, the Messiah, but you are not obliged to believe (it).
+Sometimes I joke.
+
 ## Another word?
-Yes. No warmonger, no militaro-industrial-complex disciple, no one holding a gun is allowed to use Multics.
+
+Yes. No warmonger, no militaro-industrial-complex disciple, no one holding a
+gun is allowed to use MiLTuX.
+
+---
+
+## What MiLTuX implements
+
+MiLTuX brings three of Multics' most important contributions to life in
+userspace:
+
+| Multics concept | MiLTuX module | Description |
+|---|---|---|
+| **Ring-based protection** | `src/ring.{h,c}` | Rings 0–7; 0 = kernel (most privileged), 7 = unprivileged user. Ring brackets control privilege transitions. |
+| **Access Control Lists** | `src/acl.{h,c}` | Per-object ACLs with `r` (read), `w` (write), `e` (execute/search), `a` (append) permissions and per-entry ring limits. |
+| **Hierarchical file system** | `src/fs.{h,c}` | In-memory segment tree using the Multics path separator `>` (e.g. `>user_dir_dir>alice>mail`). |
+| **Command shell** | `src/shell.{h,c}` | Interactive REPL inspired by the Multics command language. |
+
+---
+
+## Building
+
+MiLTuX requires only a C99-capable compiler and POSIX `make`.
+No third-party libraries, no platform-specific flags.
+
+```sh
+make          # builds  build/miltux
+make test     # runs all unit + integration tests
+make clean    # removes the build/ directory
+make install  # installs to /usr/local/bin/miltux  (override with PREFIX=...)
+```
+
+Tested with `gcc` and `clang` on Linux and macOS.
+The `CC` and `PREFIX` variables are honoured from the environment:
+
+```sh
+CC=clang PREFIX=$HOME/.local make install
+```
+
+---
+
+## Running
+
+```
+build/miltux [-u <identity>] [-r <ring>]
+
+  -u <identity>   run as the given identity  (default: your login name)
+  -r <ring>       start at ring 0–7          (default: 4 = user ring)
+  -h              show this help
+```
+
+Example — start as user `alice` at the default ring:
+
+```sh
+build/miltux -u alice
+```
+
+---
+
+## Shell commands
+
+Once inside MiLTuX you are at an interactive prompt:
+
+```
+miltux(alice:4)>>
+```
+
+The prompt shows your identity and current ring.
+
+| Command | Description |
+|---|---|
+| `ls [path]` | List the contents of a directory |
+| `cd <path>` | Change the current directory |
+| `mkdir <path>` | Create a new directory |
+| `rm <path>` | Remove a file or empty directory |
+| `cat <path>` | Display the contents of a file |
+| `write <path> <text…>` | Write (or overwrite) a file with the given text |
+| `acl <path>` | Show the ACL of a segment |
+| `ring` | Show the current ring level |
+| `su <ring>` | Attempt a ring transition (outward always allowed; inward requires bracket clearance) |
+| `whoami` | Show your identity and ring |
+| `pwd` | Print the working directory |
+| `help` | Show command summary |
+| `exit` / `quit` | Leave MiLTuX |
+
+### Example session
+
+```
+miltux(alice:4)>> mkdir docs
+miltux(alice:4)>> cd docs
+miltux(alice:4)>docs> write readme.txt Hello from MiLTuX
+miltux(alice:4)>docs> cat readme.txt
+Hello from MiLTuX
+miltux(alice:4)>docs> acl readme.txt
+ACL for readme.txt:
+  Identity              Perms   Ring limit
+  --------              -----   ----------
+  alice                 rwea    7
+  *                     r---    7
+miltux(alice:4)>docs> su 0
+su: permission denied
+miltux(alice:4)>docs> exit
+Farewell from MiLTuX.
+```
+
+---
+
+## Path conventions
+
+MiLTuX uses `>` as the path separator, faithful to Multics:
+
+| MiLTuX path | Unix equivalent |
+|---|---|
+| `>` | `/` |
+| `>user_dir_dir>alice` | `/home/alice` |
+| `>system` | `/usr` or `/lib` |
+
+Both absolute (`>foo>bar`) and relative (`bar`) paths are accepted.
+The special components `.` and `..` work as expected.
+
+---
+
+## Architecture
+
+```
+src/
+  miltux.h / miltux.c   Core types, error codes, miltux_strerror()
+  ring.h   / ring.c     Ring protection (ring_ctx_t, ring_bracket_t)
+  acl.h    / acl.c      Access Control Lists (acl_t, acl_entry_t)
+  fs.h     / fs.c       Hierarchical file system (fs_t, fs_node_t)
+  shell.h  / shell.c    Interactive command shell (shell_t)
+  main.c                Entry point, CLI argument parsing
+tests/
+  test_miltux.c         24 unit + integration tests (no external deps)
+```
+
+All modules are independent C compilation units with clear, minimal interfaces.
+The test binary links everything except `main.c`.
+
+---
+
+## Contributing
+
+Patches welcome.  Ground rules:
+
+1. C99 only.  No compiler extensions, no platform-specific headers outside `main.c`.
+2. Every new public function needs a declaration comment in its `.h` file.
+3. New features must come with tests in `tests/test_miltux.c`.
+4. `make test` must pass with zero warnings before opening a PR.
+5. No warmongers. See above.
