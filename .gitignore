@@ -1,0 +1,9 @@
+# Build artefacts
+build/
+*.o
+*.a
+
+# Editor swap files
+*.swp
+*~
+.DS_Store
