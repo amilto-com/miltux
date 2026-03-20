@@ -4,11 +4,13 @@
  * Usage: miltux [options]
  *   -u <identity>   run as the given identity (default: current POSIX user)
  *   -r <ring>       start at ring <ring> (default: 4 = user ring)
+ *   -l [port]       listen for peer connections on port (default: 7070)
  *   -h              show usage
  */
 
 #include "miltux.h"
 #include "shell.h"
+#include "net.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,11 +21,13 @@
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-u <identity>] [-r <ring>]\n"
+            "Usage: %s [-u <identity>] [-r <ring>] [-l [port]]\n"
             "  -u <identity>  run as identity (default: login name)\n"
             "  -r <ring>      start at ring 0-%d (default: %d)\n"
+            "  -l [port]      listen for peers on port (default: %d)\n"
             "  -h             show this help\n",
-            prog, MILTUX_RING_MAX, MILTUX_RING_USER);
+            prog, MILTUX_RING_MAX, MILTUX_RING_USER,
+            MILTUX_NET_PORT_DEFAULT);
 }
 
 static void get_default_identity(char *buf, size_t len)
@@ -48,12 +52,13 @@ static void get_default_identity(char *buf, size_t len)
 int main(int argc, char *argv[])
 {
     char identity[MILTUX_NAME_MAX + 1];
-    int  ring = MILTUX_RING_USER;
+    int  ring      = MILTUX_RING_USER;
+    int  listen_port = -1;   /* -1 = don't listen */
     int  opt;
 
     get_default_identity(identity, sizeof(identity));
 
-    while ((opt = getopt(argc, argv, "u:r:h")) != -1) {
+    while ((opt = getopt(argc, argv, "u:r:l::h")) != -1) {
         switch (opt) {
         case 'u':
             strncpy(identity, optarg, MILTUX_NAME_MAX);
@@ -70,6 +75,20 @@ int main(int argc, char *argv[])
             ring = (int)r;
             break;
         }
+        case 'l':
+            if (optarg) {
+                char *end;
+                long  p = strtol(optarg, &end, 10);
+                if (*end != '\0' || p < 1 || p > 65535) {
+                    fprintf(stderr, "miltux: invalid port '%s'\n", optarg);
+                    usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                listen_port = (int)p;
+            } else {
+                listen_port = MILTUX_NET_PORT_DEFAULT;
+            }
+            break;
         case 'h':
             usage(argv[0]);
             return EXIT_SUCCESS;
@@ -85,6 +104,19 @@ int main(int argc, char *argv[])
         fprintf(stderr, "miltux: failed to initialise: %s\n",
                 miltux_strerror(err));
         return EXIT_FAILURE;
+    }
+
+    /* Start listening if -l was given */
+    if (listen_port >= 0) {
+        err = net_listen(&sh.net, listen_port, identity);
+        if (err != MILTUX_OK) {
+            fprintf(stderr, "miltux: cannot listen on port %d: %s\n",
+                    listen_port, miltux_strerror(err));
+            /* Non-fatal: continue without listening */
+        } else {
+            fprintf(stderr, "miltux: listening for peers on port %d\n",
+                    sh.net.port);
+        }
     }
 
     shell_run(&sh);

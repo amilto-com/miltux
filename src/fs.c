@@ -470,3 +470,56 @@ miltux_err_t fs_list(fs_t *fs, const char *path,
 
     return MILTUX_OK;
 }
+
+int fs_list_buf(fs_t *fs, const char *path,
+                const char *accessor, int ring,
+                char *buf, size_t bufsz)
+{
+    miltux_err_t err;
+    fs_node_t   *node;
+    char         pstr[5];
+    int          i;
+    size_t       pos = 0;
+
+    if (!fs || !path || !accessor || !buf || bufsz == 0) return -1;
+
+    node = fs_resolve(fs, path, &err);
+    if (!node) return -1;
+    if (node->type != FS_NODE_DIR) return -1;
+
+    err = acl_check(&node->acl, accessor, ring,
+                    ACL_PERM_READ | ACL_PERM_EXEC);
+    if (err != MILTUX_OK) return -1;
+
+    for (i = 0; i < node->child_count; i++) {
+        fs_node_t *child = node->children[i];
+        int eff = ACL_PERM_NONE;
+        if (acl_check(&child->acl, accessor, ring, ACL_PERM_READ)  == MILTUX_OK)
+            eff |= ACL_PERM_READ;
+        if (acl_check(&child->acl, accessor, ring, ACL_PERM_WRITE) == MILTUX_OK)
+            eff |= ACL_PERM_WRITE;
+        if (acl_check(&child->acl, accessor, ring, ACL_PERM_EXEC)  == MILTUX_OK)
+            eff |= ACL_PERM_EXEC;
+        if (acl_check(&child->acl, accessor, ring, ACL_PERM_APPEND)== MILTUX_OK)
+            eff |= ACL_PERM_APPEND;
+
+        acl_perm_str(eff, pstr);
+        int written = snprintf(buf + pos, bufsz - pos, "  %s  %s%s\n",
+                               pstr, child->name,
+                               child->type == FS_NODE_DIR ? ">" : "");
+        if (written < 0 || (size_t)written >= bufsz - pos) break;
+        pos += (size_t)written;
+    }
+
+    if (node->child_count == 0) {
+        const char *empty = "  (empty)\n";
+        size_t      elen  = strlen(empty);
+        if (pos + elen < bufsz) {
+            memcpy(buf + pos, empty, elen);
+            pos += elen;
+        }
+    }
+
+    buf[pos] = '\0';
+    return (int)pos;
+}

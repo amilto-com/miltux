@@ -26,6 +26,7 @@
 #include "miltux.h"
 #include "ring.h"
 #include "fs.h"
+#include "net.h"
 
 /* -----------------------------------------------------------------------
  * Shell session state
@@ -33,6 +34,7 @@
 typedef struct {
     ring_ctx_t  ring_ctx;
     fs_t        fs;
+    net_t       net;                      /* peer-to-peer networking state */
     char        identity[MILTUX_NAME_MAX + 1];
 } shell_t;
 

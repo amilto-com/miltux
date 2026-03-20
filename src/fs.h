@@ -98,4 +98,14 @@ miltux_err_t fs_chdir(fs_t *fs, const char *path,
 miltux_err_t fs_list(fs_t *fs, const char *path,
                       const char *accessor, int ring);
 
+/*
+ * Serialize directory contents into buf (at most bufsz bytes).
+ * Returns the number of bytes written (>= 0) on success,
+ * or -1 on error (permission denied, not a directory, etc.).
+ * Used by the network layer to send ls output over a socket.
+ */
+int fs_list_buf(fs_t *fs, const char *path,
+                const char *accessor, int ring,
+                char *buf, size_t bufsz);
+
 #endif /* FS_H */

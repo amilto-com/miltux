@@ -11,10 +11,19 @@
 #include "acl.h"
 #include "fs.h"
 #include "shell.h"
+#include "net.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>       /* fork, dup2, STDOUT_FILENO, _exit */
+#include <fcntl.h>        /* open, O_WRONLY */
+#include <time.h>         /* nanosleep */
+#include <signal.h>       /* kill, SIGKILL */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>     /* waitpid */
 
 /* -----------------------------------------------------------------------
  * Minimal test framework
@@ -380,6 +389,140 @@ static int test_shell_exec_empty(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Networking tests
+ * ----------------------------------------------------------------------- */
+
+/* Timing constants for the fork-based network test */
+#define NET_TEST_CONNECT_DELAY_NS  (50L * 1000000L)  /* 50 ms: wait for server */
+#define NET_TEST_POLL_INTERVAL_NS  (20L * 1000000L)  /* 20 ms per poll cycle  */
+#define NET_TEST_MAX_POLLS         50                 /* 50 × 20 ms = 1 s max  */
+
+static int test_net_init(void)
+{
+    net_t net;
+    net_init(&net);
+    ASSERT(net.listen_fd  == -1);
+    ASSERT(net.peer_count ==  0);
+    net_destroy(&net);
+    return 0;
+}
+
+static int test_net_listen_on_random_port(void)
+{
+    net_t net;
+    net_init(&net);
+
+    /* port=0 lets the OS pick a free port */
+    ASSERT(net_listen(&net, 0, "test") == MILTUX_OK);
+    ASSERT(net.listen_fd >= 0);
+    ASSERT(net.port > 0);       /* OS should have assigned a real port */
+
+    net_destroy(&net);
+    ASSERT(net.listen_fd == -1);
+    return 0;
+}
+
+/*
+ * Fork a server and a client; client connects, does a remote LS, verifies
+ * the response.  Uses fork() + wait() to simulate two nodes in one test run.
+ */
+static int test_net_connect_and_remote_ls(void)
+{
+    net_t server;
+    net_init(&server);
+
+    /* Bind to a random port */
+    ASSERT(net_listen(&server, 0, "server") == MILTUX_OK);
+    int port = server.port;
+
+    /* Flush stdio before fork so the child starts with a clean buffer */
+    fflush(NULL);
+
+    pid_t pid = fork();
+    ASSERT(pid >= 0);
+
+    if (pid == 0) {
+        /* -------- child: act as the client -------- */
+
+        /* Redirect stdout and stderr to /dev/null so child output does not
+         * interleave with the parent test runner's output. */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        /* Give the server a moment to enter accept() */
+        struct timespec ts = {0, NET_TEST_CONNECT_DELAY_NS};
+        nanosleep(&ts, NULL);
+
+        net_t client;
+        net_init(&client);
+
+        int idx = net_connect(&client, "127.0.0.1", port, "client");
+        if (idx < 0) _exit(1);
+
+        /* Remote ls of root */
+        miltux_err_t err = net_remote_ls(&client.peers[idx], ">",
+                                         "client", MILTUX_RING_USER);
+        net_destroy(&client);
+        _exit(err == MILTUX_OK ? 0 : 2);
+    }
+
+    /* -------- parent: act as the server -------- */
+    shell_t sh;
+    shell_init(&sh, "server", MILTUX_RING_USER);
+    server._sh = &sh;
+
+    /* Poll until the child finishes (with a generous timeout) */
+    int i;
+    for (i = 0; i < NET_TEST_MAX_POLLS; i++) {
+        net_poll(&server, &sh);
+
+        struct timespec ts = {0, NET_TEST_POLL_INTERVAL_NS};
+        nanosleep(&ts, NULL);
+
+        int    status = 0;
+        pid_t  w      = waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            net_destroy(&server);
+            shell_destroy(&sh);
+            return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+        }
+    }
+
+    /* Timed out: clean up the child */
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    net_destroy(&server);
+    shell_destroy(&sh);
+    return 1;
+}
+
+static int test_fs_list_buf(void)
+{
+    fs_t fs;
+    fs_init(&fs);
+    fs_mkdir(&fs, ">alpha", "alice", MILTUX_RING_MAX);
+    fs_write(&fs, ">beta.txt", "data", 4, "alice", MILTUX_RING_MAX);
+
+    char buf[4096];
+    int  n = fs_list_buf(&fs, ">", "alice", MILTUX_RING_MAX,
+                         buf, sizeof(buf));
+    ASSERT(n > 0);
+    ASSERT(strstr(buf, "alpha") != NULL);
+    ASSERT(strstr(buf, "beta.txt") != NULL);
+
+    /* Should fail for a file node */
+    ASSERT(fs_list_buf(&fs, ">beta.txt", "alice", MILTUX_RING_MAX,
+                       buf, sizeof(buf)) < 0);
+
+    fs_destroy(&fs);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
  * Main test runner
  * ----------------------------------------------------------------------- */
 
@@ -418,6 +561,12 @@ int main(void)
     RUN_TEST(test_shell_exec_write_cat);
     RUN_TEST(test_shell_exec_unknown_cmd);
     RUN_TEST(test_shell_exec_empty);
+
+    printf("\nNetworking:\n");
+    RUN_TEST(test_net_init);
+    RUN_TEST(test_net_listen_on_random_port);
+    RUN_TEST(test_fs_list_buf);
+    RUN_TEST(test_net_connect_and_remote_ls);
 
     printf("\n=== Results: %d/%d passed ===\n",
            tests_run - tests_failed, tests_run);

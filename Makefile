@@ -35,6 +35,7 @@ SRCS    = $(SRCDIR)/miltux.c \
           $(SRCDIR)/ring.c   \
           $(SRCDIR)/acl.c    \
           $(SRCDIR)/fs.c     \
+          $(SRCDIR)/net.c    \
           $(SRCDIR)/shell.c  \
           $(SRCDIR)/main.c
 

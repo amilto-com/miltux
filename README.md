@@ -77,17 +77,24 @@ CC=clang PREFIX=$HOME/.local make install
 ## Running
 
 ```
-build/miltux [-u <identity>] [-r <ring>]
+build/miltux [-u <identity>] [-r <ring>] [-l [port]]
 
   -u <identity>   run as the given identity  (default: your login name)
   -r <ring>       start at ring 0–7          (default: 4 = user ring)
+  -l [port]       start listening for peers  (default port: 7070)
   -h              show this help
 ```
 
-Example — start as user `alice` at the default ring:
+Example — start as user `alice` and immediately listen for peers:
 
 ```sh
-build/miltux -u alice
+build/miltux -u alice -l
+```
+
+Or on a custom port:
+
+```sh
+build/miltux -u alice -l 9090
 ```
 
 ---
@@ -117,6 +124,46 @@ The prompt shows your identity and current ring.
 | `pwd` | Print the working directory |
 | `help` | Show command summary |
 | `exit` / `quit` | Leave MiLTuX |
+
+### Networking — forming the mega-computer
+
+Every MiLTuX instance can connect to peers running on other POSIX machines.
+Together they form a distributed system where your identity and ring level
+travel with your operations.
+
+| Command | Description |
+|---|---|
+| `listen [port]` | Start accepting incoming peer connections (default port 7070) |
+| `connect <host> [port]` | Connect to a remote MiLTuX peer |
+| `nodes` | List all connected peers |
+| `rls <node#> <path>` | List a directory on a remote node |
+| `rcat <node#> <path>` | Read a file from a remote node |
+| `rmkdir <node#> <path>` | Create a directory on a remote node |
+| `rwrite <node#> <path> <text…>` | Write a file on a remote node |
+
+#### Connecting two nodes (quick start)
+
+On machine A:
+```
+build/miltux -u alice -l 7070
+```
+
+On machine B:
+```
+build/miltux -u bob
+miltux(bob:4)>> connect machineA.example.com 7070
+Connected to alice@machineA:7070 (node #0).
+miltux(bob:4)>> rls 0 >
+  r-e-  system>
+  r-e-  user_dir_dir>
+miltux(bob:4)>> rwrite 0 >shared.txt Hello from machine B
+miltux(bob:4)>> rcat 0 >shared.txt
+Hello from machine B
+```
+
+The connection is authenticated by identity names (passed in the TCP
+handshake); remote FS operations respect the ACLs on the target node,
+checked against the caller's identity and ring level.
 
 ### Example session
 
@@ -163,10 +210,11 @@ src/
   ring.h   / ring.c     Ring protection (ring_ctx_t, ring_bracket_t)
   acl.h    / acl.c      Access Control Lists (acl_t, acl_entry_t)
   fs.h     / fs.c       Hierarchical file system (fs_t, fs_node_t)
+  net.h    / net.c      TCP peer mesh; simple line-based protocol (net_t, net_peer_t)
   shell.h  / shell.c    Interactive command shell (shell_t)
   main.c                Entry point, CLI argument parsing
 tests/
-  test_miltux.c         24 unit + integration tests (no external deps)
+  test_miltux.c         28 unit + integration tests (no external deps)
 ```
 
 All modules are independent C compilation units with clear, minimal interfaces.

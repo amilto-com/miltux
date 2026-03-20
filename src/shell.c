@@ -3,6 +3,7 @@
  */
 
 #include "shell.h"
+#include "net.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,16 @@ static void cmd_help(void)
         "  su   <ring>              switch ring (0=kernel .. 7=user)\n"
         "  whoami                   show current identity\n"
         "  pwd                      print working directory\n"
+        "\n"
+        "Networking (distributed mega-computer):\n"
+        "  listen  [port]           start accepting peer connections\n"
+        "  connect <host> [port]    connect to a remote peer\n"
+        "  nodes                    list connected peers\n"
+        "  rls     <node#> <path>   list directory on remote node\n"
+        "  rcat    <node#> <path>   read file from remote node\n"
+        "  rmkdir  <node#> <path>   create directory on remote node\n"
+        "  rwrite  <node#> <path> <text...>  write file on remote node\n"
+        "\n"
         "  help                     show this help\n"
         "  exit | quit              leave MiLTuX\n"
     );
@@ -218,6 +229,160 @@ static void cmd_acl(shell_t *sh, int argc, char *argv[])
 }
 
 /* -----------------------------------------------------------------------
+ * Networking command handlers
+ * ----------------------------------------------------------------------- */
+
+static void cmd_listen(shell_t *sh, int argc, char *argv[])
+{
+    int port = MILTUX_NET_PORT_DEFAULT;
+    if (argc >= 2) {
+        char *end;
+        long  p = strtol(argv[1], &end, 10);
+        if (*end != '\0' || p < 1 || p > 65535) {
+            fprintf(stderr, "listen: invalid port '%s'\n", argv[1]);
+            return;
+        }
+        port = (int)p;
+    }
+
+    if (sh->net.listen_fd >= 0) {
+        printf("Already listening on port %d.\n", sh->net.port);
+        return;
+    }
+
+    miltux_err_t err = net_listen(&sh->net, port, sh->identity);
+    if (err != MILTUX_OK)
+        fprintf(stderr, "listen: %s\n", miltux_strerror(err));
+    else
+        printf("Listening on port %d. Share this port with peers.\n",
+               sh->net.port);
+}
+
+static void cmd_connect(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "connect: usage: connect <host> [port]\n");
+        return;
+    }
+    int port = MILTUX_NET_PORT_DEFAULT;
+    if (argc >= 3) {
+        char *end;
+        long  p = strtol(argv[2], &end, 10);
+        if (*end != '\0' || p < 1 || p > 65535) {
+            fprintf(stderr, "connect: invalid port '%s'\n", argv[2]);
+            return;
+        }
+        port = (int)p;
+    }
+
+    int idx = net_connect(&sh->net, argv[1], port, sh->identity);
+    if (idx < 0)
+        fprintf(stderr, "connect: %s\n", miltux_strerror((miltux_err_t)idx));
+    else
+        printf("Connected to %s@%s:%d (node #%d).\n",
+               sh->net.peers[idx].identity, argv[1], port, idx);
+}
+
+static void cmd_nodes(shell_t *sh)
+{
+    if (sh->net.listen_fd >= 0)
+        printf("Listening on port %d.\n", sh->net.port);
+    net_list_peers(&sh->net);
+}
+
+/* Parse a node index from argv[1]; returns -1 and prints error on failure */
+static int parse_node_idx(shell_t *sh, const char *s)
+{
+    char *end;
+    long  idx = strtol(s, &end, 10);
+    if (*end != '\0' || idx < 0 || idx >= sh->net.peer_count
+            || sh->net.peers[(int)idx].fd < 0) {
+        fprintf(stderr, "unknown node '%s' (use 'nodes' to list)\n", s);
+        return -1;
+    }
+    return (int)idx;
+}
+
+static void cmd_rls(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "rls: usage: rls <node#> <path>\n");
+        return;
+    }
+    int idx = parse_node_idx(sh, argv[1]);
+    if (idx < 0) return;
+    miltux_err_t err = net_remote_ls(&sh->net.peers[idx], argv[2],
+                                     sh->identity,
+                                     ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "rls: %s\n", miltux_strerror(err));
+}
+
+static void cmd_rcat(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "rcat: usage: rcat <node#> <path>\n");
+        return;
+    }
+    int idx = parse_node_idx(sh, argv[1]);
+    if (idx < 0) return;
+    miltux_err_t err = net_remote_cat(&sh->net.peers[idx], argv[2],
+                                      sh->identity,
+                                      ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "rcat: %s\n", miltux_strerror(err));
+}
+
+static void cmd_rmkdir(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "rmkdir: usage: rmkdir <node#> <path>\n");
+        return;
+    }
+    int idx = parse_node_idx(sh, argv[1]);
+    if (idx < 0) return;
+    miltux_err_t err = net_remote_mkdir(&sh->net.peers[idx], argv[2],
+                                        sh->identity,
+                                        ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "rmkdir: %s\n", miltux_strerror(err));
+}
+
+static void cmd_rwrite(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 4) {
+        fprintf(stderr, "rwrite: usage: rwrite <node#> <path> <text...>\n");
+        return;
+    }
+    int idx = parse_node_idx(sh, argv[1]);
+    if (idx < 0) return;
+
+    /* Reconstruct text from remaining arguments */
+    char   text[MILTUX_FILE_MAX];
+    size_t pos = 0;
+    int    i;
+    for (i = 3; i < argc; i++) {
+        size_t alen = strlen(argv[i]);
+        if (pos + alen + 2 > MILTUX_FILE_MAX) {
+            fprintf(stderr, "rwrite: text too long\n");
+            return;
+        }
+        if (i > 3) text[pos++] = ' ';
+        memcpy(text + pos, argv[i], alen);
+        pos += alen;
+    }
+    text[pos++] = '\n';
+    text[pos]   = '\0';
+
+    miltux_err_t err = net_remote_write(&sh->net.peers[idx], argv[2],
+                                        text, pos,
+                                        sh->identity,
+                                        ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "rwrite: %s\n", miltux_strerror(err));
+}
+
+/* -----------------------------------------------------------------------
  * Public API
  * ----------------------------------------------------------------------- */
 
@@ -232,6 +397,9 @@ miltux_err_t shell_init(shell_t *sh, const char *identity, int ring)
 
     err = fs_init(&sh->fs);
     if (err != MILTUX_OK) return err;
+
+    net_init(&sh->net);
+    sh->net._sh = sh;   /* back-pointer for server-side dispatch */
 
     strncpy(sh->identity, identity, MILTUX_NAME_MAX);
     sh->identity[MILTUX_NAME_MAX] = '\0';
@@ -250,6 +418,7 @@ miltux_err_t shell_init(shell_t *sh, const char *identity, int ring)
 void shell_destroy(shell_t *sh)
 {
     if (!sh) return;
+    net_destroy(&sh->net);
     fs_destroy(&sh->fs);
 }
 
@@ -301,6 +470,20 @@ miltux_err_t shell_exec(shell_t *sh, const char *line)
         cmd_write(sh, argc, argv);
     } else if (strcmp(cmd, "acl") == 0) {
         cmd_acl(sh, argc, argv);
+    } else if (strcmp(cmd, "listen") == 0) {
+        cmd_listen(sh, argc, argv);
+    } else if (strcmp(cmd, "connect") == 0) {
+        cmd_connect(sh, argc, argv);
+    } else if (strcmp(cmd, "nodes") == 0) {
+        cmd_nodes(sh);
+    } else if (strcmp(cmd, "rls") == 0) {
+        cmd_rls(sh, argc, argv);
+    } else if (strcmp(cmd, "rcat") == 0) {
+        cmd_rcat(sh, argc, argv);
+    } else if (strcmp(cmd, "rmkdir") == 0) {
+        cmd_rmkdir(sh, argc, argv);
+    } else if (strcmp(cmd, "rwrite") == 0) {
+        cmd_rwrite(sh, argc, argv);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         return MILTUX_ERR_RANGE; /* sentinel: caller checks for exit */
     } else {
@@ -314,10 +497,13 @@ void shell_run(shell_t *sh)
 {
     char line[LINE_MAX_LEN];
 
-    printf("MiLTuX — A Multics-inspired system\n");
+    printf("MiLTuX — A Multics-inspired distributed system\n");
     printf("Type 'help' for a list of commands.\n\n");
 
     while (1) {
+        /* Poll for incoming peer connections and requests (non-blocking) */
+        net_poll(&sh->net, sh);
+
         printf("miltux(%s:%d)%s> ",
                sh->identity,
                ring_current(&sh->ring_ctx),
