@@ -494,6 +494,17 @@ void net_gossip(net_t *net, const char *identity)
     for (i = 0; i < net->peer_count; i++) {
         if (net->peers[i].fd < 0) continue;
 
+        /*
+         * Skip peers that connected TO us (server_accepted == 1).
+         * Those are interactive client sessions (e.g. `miltux -l0`), not
+         * daemon peers.  Gossiping with them causes a race condition: the
+         * daemon sends "PEERS" on the shared socket while the client is
+         * waiting for a FS-operation response (LS/CAT/…), so the client
+         * reads "PEERS" instead of "DATA …" and gets MILTUX_ERR_PERM.
+         * Client sessions still discover peers via their own gossip calls.
+         */
+        if (net->peers[i].server_accepted) continue;
+
         /* Request peer list */
         if (!send_line(net->peers[i].fd, "PEERS")) continue;
         if (!recv_line(net->peers[i].fd, resp, sizeof(resp))) continue;
@@ -634,6 +645,7 @@ void net_poll(net_t *net, void *sh)
                     strncpy(p->host, p->identity, sizeof(p->host) - 1);
                     p->host[sizeof(p->host) - 1] = '\0';
                     p->port = peer_port;
+                    p->server_accepted = 1; /* they connected to us */
 
                     /* Reject duplicates and self-connections */
                     if (already_connected(net, p->identity) ||
@@ -711,6 +723,7 @@ int net_connect(net_t *net, const char *host, int port, const char *identity)
 
     /* Use listen port from handshake if available */
     if (peer_port > 0) p->port = peer_port;
+    p->server_accepted = 0; /* we connected to them (daemon peer) */
 
     /* Reject self-connections and duplicates */
     if (strcmp(p->identity, identity) == 0 ||

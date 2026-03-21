@@ -66,6 +66,11 @@ typedef struct {
     char host[256];                       /* host used to reach this peer   */
     int  port;                            /* remote LISTEN port             */
     char identity[MILTUX_NAME_MAX + 1];  /* remote identity (from hello)   */
+    int  server_accepted;                 /* 1 = they connected to us (client session);
+                                            0 = we connected to them (daemon peer).
+                                            Client sessions are excluded from gossip
+                                            to avoid mixing PEERS messages with FS
+                                            operation responses on the same socket. */
 } net_peer_t;
 
 /* -----------------------------------------------------------------------
