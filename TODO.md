@@ -113,16 +113,26 @@ anything more than a proof-of-concept.  Contributions welcome.
 ## Networking (distributed mega-computer)
 
 - [x] TCP peer-to-peer mesh — nodes connect to each other over POSIX sockets
-- [x] Simple line-based protocol (handshake, LS / CAT / MKDIR / WRITE / REMOVE)
-- [x] `listen [port]` / `connect <host> [port]` / `nodes` shell commands
-- [x] Remote FS commands: `rls`, `rcat`, `rmkdir`, `rwrite`
+- [x] Line-based protocol (handshake, LS / CAT / MKDIR / WRITE / REMOVE / PEERS)
+- [x] `listen [port]` / `connect <host> [port]` / `nodes` / `r*` shell commands
 - [x] `-l [port]` CLI flag to start listening at launch
-- [ ] **Mutable namespace** — propagate mkdir/write/remove from one node to all peers automatically (gossip or broadcast)
-- [ ] **Global namespace mount** — `mount <node#>:<remote-path> <local-path>` makes a remote subtree appear in the local FS tree transparently
-- [ ] **Node discovery / directory** — a well-known "name server" segment that lists all active nodes; new nodes register on connect
-- [ ] **Encrypted transport** — wrap the TCP connection in TLS (using OS-provided APIs where available)
-- [ ] **Remote ring enforcement** — the target node should honour the caller's claimed ring only when the caller can prove their identity (needs authentication first)
-- [ ] **IPv6 support** — `getaddrinfo` already handles it; just set `AF_UNSPEC` instead of `AF_INET`
+- [x] **Gossip protocol** (`PEERS` message) — nodes exchange peer lists and auto-connect
+- [x] **Pending-peer retry queue** — failed connections are retried every ~3 s
+- [x] **`MILTUX_PEERS` env var** — comma-separated seed peers auto-connected at startup
+- [x] **Daemon mode** (`-d`) — headless node for container deployments
+- [x] **Socket timeouts** (`SO_RCVTIMEO` / `SO_SNDTIMEO`) — prevent blocked peers from hanging the node
+- [x] **Self/duplicate connection guards** — identity-based deduplication in the peer table
+- [x] **`examples/megacomputer/`** — 7-node Docker Compose cluster with auto-discovery
+- [ ] **Persistent storage** — file data currently lives only in memory; nodes lose state on restart
+- [ ] **Broadcast mutations** — propagate mkdir/write/remove to all peers for a shared namespace
+- [ ] **Global namespace mount** — `mount <node#>:<path> <local-path>` transparent remote subtree
+- [ ] **Encrypted transport** — TLS wrapping of the TCP channel
+- [ ] **Identity authentication** — signed handshake so ring claims are verifiable
+- [ ] **IPv6** — change `AF_INET` to `AF_UNSPEC` in `net_connect` / `net_listen`
+
+---
+
+## Someday / maybe
 
 - [ ] Multi-user daemon mode — a background process that multiple shells
       connect to over a Unix-domain socket.

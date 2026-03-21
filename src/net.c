@@ -25,6 +25,16 @@
  * Low-level I/O helpers
  * ----------------------------------------------------------------------- */
 
+/* Set per-socket send/recv timeout */
+static void set_sock_timeout(int fd, int seconds)
+{
+    struct timeval tv;
+    tv.tv_sec  = seconds;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 /* Write exactly len bytes; return 1 on success, 0 on error */
 static int send_all(int fd, const char *buf, size_t len)
 {
@@ -93,48 +103,62 @@ static int send_data(int fd, const char *data, size_t len)
     return 1;
 }
 
-
-
 /* -----------------------------------------------------------------------
  * Handshake
+ *
+ * Format includes the listen port so gossip can share reconnectable
+ * addresses without knowing each peer's hostname separately.
  * ----------------------------------------------------------------------- */
 
-/* Server side: greet client, learn client identity */
+/* Server side: greet client, learn client identity + listen port */
 static int do_server_handshake(int fd, const char *local_identity,
-                                char *peer_identity, size_t pid_size)
+                                int local_listen_port,
+                                char *peer_identity, size_t pid_size,
+                                int *peer_listen_port)
 {
     char line[512];
+    char fmt[32];
 
-    /* Send greeting */
-    snprintf(line, sizeof(line), "MILTUX/1 %s", local_identity);
+    snprintf(line, sizeof(line), "MILTUX/1 %s %d",
+             local_identity, local_listen_port);
     if (!send_line(fd, line)) return 0;
 
-    /* Receive HELLO */
     if (!recv_line(fd, line, sizeof(line))) return 0;
     if (strncmp(line, "HELLO ", 6) != 0) return 0;
-    strncpy(peer_identity, line + 6, pid_size - 1);
+
+    /* Parse: HELLO <identity> <port> */
+    snprintf(fmt, sizeof(fmt), "%%%zus %%d", pid_size - 1);
+    int pport = 0;
+    sscanf(line + 6, fmt, peer_identity, &pport);
     peer_identity[pid_size - 1] = '\0';
+    *peer_listen_port = pport;
 
     return send_line(fd, "OK");
 }
 
 /* Client side: receive greeting, send HELLO */
 static int do_client_handshake(int fd, const char *local_identity,
-                                char *peer_identity, size_t pid_size)
+                                int local_listen_port,
+                                char *peer_identity, size_t pid_size,
+                                int *peer_listen_port)
 {
     char line[512];
+    char fmt[32];
 
-    /* Receive greeting */
     if (!recv_line(fd, line, sizeof(line))) return 0;
     if (strncmp(line, "MILTUX/1 ", 9) != 0) return 0;
-    strncpy(peer_identity, line + 9, pid_size - 1);
-    peer_identity[pid_size - 1] = '\0';
 
-    /* Send HELLO */
-    snprintf(line, sizeof(line), "HELLO %s", local_identity);
+    /* Parse: MILTUX/1 <identity> <port> */
+    snprintf(fmt, sizeof(fmt), "%%%zus %%d", pid_size - 1);
+    int pport = 0;
+    sscanf(line + 9, fmt, peer_identity, &pport);
+    peer_identity[pid_size - 1] = '\0';
+    *peer_listen_port = pport;
+
+    snprintf(line, sizeof(line), "HELLO %s %d",
+             local_identity, local_listen_port);
     if (!send_line(fd, line)) return 0;
 
-    /* Wait for OK */
     if (!recv_line(fd, line, sizeof(line))) return 0;
     return (strncmp(line, "OK", 2) == 0);
 }
@@ -154,7 +178,6 @@ static int parse_request(const char *line, char *op, size_t op_sz,
     char ring_s[16];
     char fmt[64];
 
-    /* Build a format string with widths derived from buffer sizes */
     snprintf(fmt, sizeof(fmt), "%%%zus %%15s %%%zus %%%zus",
              op_sz - 1, id_sz - 1, path_sz - 1);
 
@@ -172,7 +195,7 @@ static int parse_request(const char *line, char *op, size_t op_sz,
 static void handle_peer_request(net_t *net, int idx)
 {
     net_peer_t *peer = &net->peers[idx];
-    shell_t    *sh   = (shell_t *)net->_sh;   /* private back-pointer */
+    shell_t    *sh   = (shell_t *)net->_sh;
 
     char line[MILTUX_PATH_MAX + 256];
     if (!recv_line(peer->fd, line, sizeof(line))) {
@@ -191,6 +214,26 @@ static void handle_peer_request(net_t *net, int idx)
 
     if (strcmp(op, "QUIT") == 0) {
         net_disconnect(net, idx);
+        return;
+    }
+
+    /* PEERS: gossip — return our known peers so the caller can join them */
+    if (strcmp(op, "PEERS") == 0) {
+        char buf[4096];
+        size_t pos = 0;
+        int j;
+        for (j = 0; j < net->peer_count; j++) {
+            if (net->peers[j].fd >= 0) {
+                int w = snprintf(buf + pos, sizeof(buf) - pos,
+                                 "%s %s %d\n",
+                                 net->peers[j].identity,
+                                 net->peers[j].host,
+                                 net->peers[j].port);
+                if (w < 0 || (size_t)w >= sizeof(buf) - pos) break;
+                pos += (size_t)w;
+            }
+        }
+        send_data(peer->fd, buf, pos);
         return;
     }
 
@@ -232,7 +275,6 @@ static void handle_peer_request(net_t *net, int idx)
     } else if (strcmp(op, "WRITE") == 0) {
         /*
          * WRITE <ring> <identity> <path> <len>\n<data>
-         * All five fields on the header line, data follows immediately.
          */
         char   len_s[32];
         char   path2[MILTUX_PATH_MAX];
@@ -244,7 +286,7 @@ static void handle_peer_request(net_t *net, int idx)
         int    n2 = sscanf(line, fmt, ring_s, id2, path2, len_s);
         if (n2 < 4) { send_err(peer->fd, MILTUX_ERR_INVAL); return; }
 
-        int    wr  = (int)strtol(ring_s, NULL, 10);
+        int    wr   = (int)strtol(ring_s, NULL, 10);
         size_t wlen = (size_t)strtoul(len_s, NULL, 10);
 
         if (wlen > MILTUX_FILE_MAX) {
@@ -278,7 +320,6 @@ static void handle_peer_request(net_t *net, int idx)
  * Peer array management
  * ----------------------------------------------------------------------- */
 
-/* Remove all peers whose fd is -1 (called during poll) */
 static void compact_peers(net_t *net)
 {
     int i = 0;
@@ -295,6 +336,28 @@ static void compact_peers(net_t *net)
     }
 }
 
+/* Return 1 if we already have a live connection to this identity */
+static int already_connected(const net_t *net, const char *identity)
+{
+    int i;
+    for (i = 0; i < net->peer_count; i++)
+        if (net->peers[i].fd >= 0 &&
+            strcmp(net->peers[i].identity, identity) == 0)
+            return 1;
+    return 0;
+}
+
+/* Return 1 if host:port is already in the pending retry queue */
+static int already_pending(const net_t *net, const char *host, int port)
+{
+    int i;
+    for (i = 0; i < net->pending_count; i++)
+        if (net->pending[i].port == port &&
+            strcmp(net->pending[i].host, host) == 0)
+            return 1;
+    return 0;
+}
+
 /* -----------------------------------------------------------------------
  * Public API
  * ----------------------------------------------------------------------- */
@@ -306,16 +369,16 @@ void net_init(net_t *net)
 
     /*
      * Ignore SIGPIPE so that writing to a closed socket returns EPIPE
-     * instead of killing the process.  This is safe to call globally;
-     * the shell already handles all writes through send_all() which checks
-     * the return value.
+     * instead of killing the process.
      */
     signal(SIGPIPE, SIG_IGN);
 
-    net->listen_fd  = -1;
-    net->port       = 0;
-    net->peer_count = 0;
-    net->_sh        = NULL;
+    net->listen_fd     = -1;
+    net->port          = 0;
+    net->peer_count    = 0;
+    net->pending_count = 0;
+    net->poll_tick     = 0;
+    net->_sh           = NULL;
     for (i = 0; i < MILTUX_PEERS_MAX; i++)
         net->peers[i].fd = -1;
 }
@@ -327,7 +390,7 @@ miltux_err_t net_listen(net_t *net, int port, const char *identity)
     struct sockaddr_in addr;
     socklen_t          addrlen = sizeof(addr);
 
-    (void)identity;   /* stored via _sh; parameter kept for clarity */
+    (void)identity;
 
     if (!net) return MILTUX_ERR_INVAL;
     if (net->listen_fd >= 0) return MILTUX_ERR_EXIST;
@@ -347,7 +410,6 @@ miltux_err_t net_listen(net_t *net, int port, const char *identity)
         return MILTUX_ERR_PERM;
     }
 
-    /* Retrieve actual port (useful when port==0) */
     if (getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0)
         net->port = ntohs(addr.sin_port);
     else
@@ -362,6 +424,131 @@ miltux_err_t net_listen(net_t *net, int port, const char *identity)
     return MILTUX_OK;
 }
 
+void net_add_pending(net_t *net, const char *host, int port)
+{
+    if (!net || !host || net->pending_count >= MILTUX_PENDING_MAX) return;
+    if (already_pending(net, host, port)) return;
+
+    strncpy(net->pending[net->pending_count].host, host,
+            sizeof(net->pending[0].host) - 1);
+    net->pending[net->pending_count].host[sizeof(net->pending[0].host) - 1] = '\0';
+    net->pending[net->pending_count].port = port;
+    net->pending_count++;
+}
+
+void net_autoconnect(net_t *net, const char *identity)
+{
+    const char *env;
+    char        buf[4096];
+    char       *saveptr;
+    char       *token;
+
+    if (!net || !identity) return;
+
+    env = getenv("MILTUX_PEERS");
+    if (!env || !*env) return;
+
+    strncpy(buf, env, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    token = strtok_r(buf, ",", &saveptr);
+    while (token) {
+        /* strip leading/trailing spaces */
+        while (*token == ' ') token++;
+        size_t tlen = strlen(token);
+        while (tlen > 0 && token[tlen - 1] == ' ') token[--tlen] = '\0';
+
+        char host[256];
+        int  port = MILTUX_NET_PORT_DEFAULT;
+
+        char *colon = strrchr(token, ':');
+        if (colon) {
+            size_t hlen = (size_t)(colon - token);
+            if (hlen >= sizeof(host)) hlen = sizeof(host) - 1;
+            strncpy(host, token, hlen);
+            host[hlen] = '\0';
+            port = (int)strtol(colon + 1, NULL, 10);
+        } else {
+            strncpy(host, token, sizeof(host) - 1);
+            host[sizeof(host) - 1] = '\0';
+        }
+
+        if (host[0] != '\0' && port > 0) {
+            int idx = net_connect(net, host, port, identity);
+            if (idx < 0 && idx != MILTUX_ERR_EXIST)
+                net_add_pending(net, host, port);
+        }
+
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+}
+
+void net_gossip(net_t *net, const char *identity)
+{
+    int   i;
+    char  resp[64];
+    char *data;
+
+    if (!net || !identity) return;
+
+    for (i = 0; i < net->peer_count; i++) {
+        if (net->peers[i].fd < 0) continue;
+
+        /* Request peer list */
+        if (!send_line(net->peers[i].fd, "PEERS")) continue;
+        if (!recv_line(net->peers[i].fd, resp, sizeof(resp))) continue;
+        if (strncmp(resp, "DATA ", 5) != 0) continue;
+
+        size_t len = (size_t)strtoul(resp + 5, NULL, 10);
+        if (len == 0 || len > 16384) continue;
+
+        data = malloc(len + 1);
+        if (!data) continue;
+
+        if (!recv_bytes(net->peers[i].fd, data, len)) { free(data); continue; }
+        data[len] = '\0';
+
+        /* Parse: each line is "<identity> <host> <port>" */
+        char *saveptr;
+        char *line = strtok_r(data, "\n", &saveptr);
+        while (line) {
+            char pident[MILTUX_NAME_MAX + 1];
+            char phost[256];
+            int  pport = MILTUX_NET_PORT_DEFAULT;
+
+            pident[0] = '\0';
+            phost[0]  = '\0';
+
+            char fmt[64];
+            snprintf(fmt, sizeof(fmt), "%%%zus %%%zus %%d",
+                     sizeof(pident) - 1, sizeof(phost) - 1);
+            int n = sscanf(line, fmt, pident, phost, &pport);
+
+            if (n >= 1 && pident[0] != '\0') {
+                /* Use identity as host if no host field provided */
+                if (n < 2 || phost[0] == '\0')
+                    snprintf(phost, sizeof(phost), "%s", pident);
+
+                /* Don't connect to self */
+                if (strcmp(pident, identity) == 0) {
+                    line = strtok_r(NULL, "\n", &saveptr);
+                    continue;
+                }
+                /* Don't double-connect */
+                if (!already_connected(net, pident) &&
+                    !already_pending(net, phost, pport) &&
+                    pport > 0) {
+                    int idx = net_connect(net, phost, pport, identity);
+                    if (idx < 0 && idx != MILTUX_ERR_EXIST)
+                        net_add_pending(net, phost, pport);
+                }
+            }
+            line = strtok_r(NULL, "\n", &saveptr);
+        }
+        free(data);
+    }
+}
+
 void net_poll(net_t *net, void *sh)
 {
     fd_set         rfds;
@@ -370,11 +557,32 @@ void net_poll(net_t *net, void *sh)
     int            i;
 
     if (!net) return;
-
-    /* Keep a back-pointer to the shell for request dispatch */
     if (sh) net->_sh = sh;
 
     compact_peers(net);
+
+    net->poll_tick++;
+
+    /* Retry pending peers every MILTUX_GOSSIP_TICKS */
+    if (net->poll_tick % MILTUX_GOSSIP_TICKS == 1) {
+        shell_t *s = (shell_t *)net->_sh;
+        const char *id = s ? s->identity : "miltux";
+
+        /* Copy pending list so retries can modify it */
+        net_pending_t tmp[MILTUX_PENDING_MAX];
+        int           tmp_count = net->pending_count;
+        memcpy(tmp, net->pending, (size_t)tmp_count * sizeof(net_pending_t));
+        net->pending_count = 0;
+
+        for (i = 0; i < tmp_count; i++) {
+            int idx = net_connect(net, tmp[i].host, tmp[i].port, id);
+            if (idx < 0 && idx != MILTUX_ERR_EXIST)
+                net_add_pending(net, tmp[i].host, tmp[i].port);
+        }
+
+        /* Gossip with connected peers */
+        net_gossip(net, id);
+    }
 
     FD_ZERO(&rfds);
 
@@ -406,22 +614,38 @@ void net_poll(net_t *net, void *sh)
 
         if (cfd >= 0) {
             if (net->peer_count >= MILTUX_PEERS_MAX) {
-                /* Refuse: too many peers */
                 close(cfd);
             } else {
                 shell_t    *s = (shell_t *)net->_sh;
                 net_peer_t *p = &net->peers[net->peer_count];
-                p->fd   = cfd;
-                p->port = ntohs(caddr.sin_port);
+                p->fd = cfd;
                 inet_ntop(AF_INET, &caddr.sin_addr, p->host, sizeof(p->host));
 
+                set_sock_timeout(cfd, MILTUX_SOCK_TIMEOUT_S);
+
                 const char *local_id = s ? s->identity : "miltux";
-                if (do_server_handshake(cfd, local_id,
-                                        p->identity, sizeof(p->identity))) {
-                    printf("[net] peer connected: %s@%s:%d\n",
-                           p->identity, p->host, p->port);
-                    fflush(stdout);
-                    net->peer_count++;
+                int local_port = net->port;
+                int peer_port  = 0;
+
+                if (do_server_handshake(cfd, local_id, local_port,
+                                        p->identity, sizeof(p->identity),
+                                        &peer_port)) {
+                    /* Use identity as canonical host for gossip */
+                    strncpy(p->host, p->identity, sizeof(p->host) - 1);
+                    p->host[sizeof(p->host) - 1] = '\0';
+                    p->port = peer_port;
+
+                    /* Reject duplicates and self-connections */
+                    if (already_connected(net, p->identity) ||
+                        strcmp(p->identity, local_id) == 0) {
+                        close(cfd);
+                        p->fd = -1;
+                    } else {
+                        printf("[net] peer joined: %s (port %d)\n",
+                               p->identity, p->port);
+                        fflush(stdout);
+                        net->peer_count++;
+                    }
                 } else {
                     close(cfd);
                     p->fd = -1;
@@ -461,6 +685,8 @@ int net_connect(net_t *net, const char *host, int port, const char *identity)
     fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); return MILTUX_ERR_NOMEM; }
 
+    set_sock_timeout(fd, MILTUX_SOCK_TIMEOUT_S);
+
     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         close(fd);
         freeaddrinfo(res);
@@ -468,20 +694,34 @@ int net_connect(net_t *net, const char *host, int port, const char *identity)
     }
     freeaddrinfo(res);
 
-    /* Find a free slot */
     p = &net->peers[net->peer_count];
     p->fd   = fd;
     p->port = port;
     strncpy(p->host, host, sizeof(p->host) - 1);
     p->host[sizeof(p->host) - 1] = '\0';
 
-    if (!do_client_handshake(fd, identity,
-                             p->identity, sizeof(p->identity))) {
+    int peer_port = 0;
+    if (!do_client_handshake(fd, identity, net->port,
+                             p->identity, sizeof(p->identity),
+                             &peer_port)) {
         close(fd);
         p->fd = -1;
         return MILTUX_ERR_PERM;
     }
 
+    /* Use listen port from handshake if available */
+    if (peer_port > 0) p->port = peer_port;
+
+    /* Reject self-connections and duplicates */
+    if (strcmp(p->identity, identity) == 0 ||
+        already_connected(net, p->identity)) {
+        close(fd);
+        p->fd = -1;
+        return MILTUX_ERR_EXIST;
+    }
+
+    printf("[net] connected to %s@%s:%d\n", p->identity, host, p->port);
+    fflush(stdout);
     return net->peer_count++;
 }
 
@@ -501,7 +741,8 @@ void net_destroy(net_t *net)
     if (!net) return;
     for (i = 0; i < net->peer_count; i++)
         net_disconnect(net, i);
-    net->peer_count = 0;
+    net->peer_count    = 0;
+    net->pending_count = 0;
     if (net->listen_fd >= 0) {
         close(net->listen_fd);
         net->listen_fd = -1;
@@ -525,13 +766,15 @@ void net_list_peers(const net_t *net)
                    net->peers[i].host,
                    net->peers[i].port);
     }
+    if (net->pending_count > 0) {
+        printf("  Pending retries: %d\n", net->pending_count);
+    }
 }
 
 /* -----------------------------------------------------------------------
  * Remote FS operations (client side)
  * ----------------------------------------------------------------------- */
 
-/* Generic: send a one-line request, expect OK or ERR */
 static miltux_err_t remote_simple(net_peer_t *peer, const char *req)
 {
     char resp[512];
@@ -543,15 +786,13 @@ static miltux_err_t remote_simple(net_peer_t *peer, const char *req)
     return MILTUX_ERR_PERM;
 }
 
-/* Generic: send a one-line request, expect DATA block, print it */
 static miltux_err_t remote_data_print(net_peer_t *peer, const char *req)
 {
-    char  resp[64];
-    char *buf     = NULL;
+    char   resp[64];
+    char  *buf    = NULL;
     size_t buflen = 0;
 
     if (!send_line(peer->fd, req)) return MILTUX_ERR_PERM;
-
     if (!recv_line(peer->fd, resp, sizeof(resp))) return MILTUX_ERR_PERM;
 
     if (strncmp(resp, "DATA ", 5) == 0) {

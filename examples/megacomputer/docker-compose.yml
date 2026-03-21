@@ -1,0 +1,95 @@
+# MiLTuX Mega-Computer — 7-node self-organising distributed system
+#
+# Seven Alpine containers, each running MiLTuX in daemon mode, automatically
+# forming a full peer mesh through gossip-based auto-discovery.
+#
+# Quick-start:
+#   docker compose up -d           # start all 7 nodes
+#   ./demo.sh                      # run the cross-node demo
+#   docker compose logs -f oracle  # follow oracle's log
+#   docker compose down            # stop and remove all nodes
+#
+# To get an interactive shell on a node:
+#   docker exec -it oracle sh
+#   miltux -u oracle -l 0          # new session on random port, auto-connects
+#                                  # to all 7 daemon nodes via MILTUX_PEERS
+#
+# Architecture note: every node's FS namespace is independent in-memory
+# storage.  Cross-node access uses the r* commands (rls, rcat, rwrite, etc.)
+# through the MiLTuX peer protocol.
+
+version: "3.9"
+
+networks:
+  megacomputer:
+    driver: bridge
+
+# ─── shared node template ────────────────────────────────────────────────────
+x-node-defaults: &node-defaults
+  build:
+    context: ../..
+    dockerfile: examples/megacomputer/Dockerfile
+  networks:
+    - megacomputer
+  restart: unless-stopped
+  environment:
+    MILTUX_PORT: "7070"
+
+# ─── services ─────────────────────────────────────────────────────────────────
+services:
+
+  oracle:
+    <<: *node-defaults
+    hostname: oracle
+    environment:
+      MILTUX_IDENTITY: oracle
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "sentinel:7070,arbiter:7070,herald:7070,nexus:7070,apex:7070,zenith:7070"
+
+  sentinel:
+    <<: *node-defaults
+    hostname: sentinel
+    environment:
+      MILTUX_IDENTITY: sentinel
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "oracle:7070,arbiter:7070,herald:7070,nexus:7070,apex:7070,zenith:7070"
+
+  arbiter:
+    <<: *node-defaults
+    hostname: arbiter
+    environment:
+      MILTUX_IDENTITY: arbiter
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "oracle:7070,sentinel:7070,herald:7070,nexus:7070,apex:7070,zenith:7070"
+
+  herald:
+    <<: *node-defaults
+    hostname: herald
+    environment:
+      MILTUX_IDENTITY: herald
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "oracle:7070,sentinel:7070,arbiter:7070,nexus:7070,apex:7070,zenith:7070"
+
+  nexus:
+    <<: *node-defaults
+    hostname: nexus
+    environment:
+      MILTUX_IDENTITY: nexus
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "oracle:7070,sentinel:7070,arbiter:7070,herald:7070,apex:7070,zenith:7070"
+
+  apex:
+    <<: *node-defaults
+    hostname: apex
+    environment:
+      MILTUX_IDENTITY: apex
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "oracle:7070,sentinel:7070,arbiter:7070,herald:7070,nexus:7070,zenith:7070"
+
+  zenith:
+    <<: *node-defaults
+    hostname: zenith
+    environment:
+      MILTUX_IDENTITY: zenith
+      MILTUX_PORT: "7070"
+      MILTUX_PEERS: "oracle:7070,sentinel:7070,arbiter:7070,herald:7070,nexus:7070,apex:7070"

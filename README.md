@@ -41,15 +41,17 @@ gun is allowed to use MiLTuX.
 
 ## What MiLTuX implements
 
-MiLTuX brings three of Multics' most important contributions to life in
-userspace:
+MiLTuX brings Multics' most important contributions to life in userspace,
+and then goes further — distributing them across a self-organising network:
 
-| Multics concept | MiLTuX module | Description |
+| Concept | Module | Description |
 |---|---|---|
 | **Ring-based protection** | `src/ring.{h,c}` | Rings 0–7; 0 = kernel (most privileged), 7 = unprivileged user. Ring brackets control privilege transitions. |
 | **Access Control Lists** | `src/acl.{h,c}` | Per-object ACLs with `r` (read), `w` (write), `e` (execute/search), `a` (append) permissions and per-entry ring limits. |
 | **Hierarchical file system** | `src/fs.{h,c}` | In-memory segment tree using the Multics path separator `>` (e.g. `>user_dir_dir>alice>mail`). |
-| **Command shell** | `src/shell.{h,c}` | Interactive REPL inspired by the Multics command language. |
+| **Command shell** | `src/shell.{h,c}` | Interactive REPL + headless daemon mode. |
+| **Distributed peer mesh** | `src/net.{h,c}` | Self-organising TCP mesh: gossip, pending-retry, auto-discovery from `MILTUX_PEERS`; remote FS ops with full ring/ACL enforcement. |
+| **Mega-computer** | `examples/megacomputer/` | 7-node Docker Compose cluster — all nodes form a full mesh automatically. |
 
 ---
 
@@ -77,24 +79,30 @@ CC=clang PREFIX=$HOME/.local make install
 ## Running
 
 ```
-build/miltux [-u <identity>] [-r <ring>] [-l [port]]
+build/miltux [-u <identity>] [-r <ring>] [-l [port]] [-d]
 
   -u <identity>   run as the given identity  (default: your login name)
   -r <ring>       start at ring 0–7          (default: 4 = user ring)
   -l [port]       start listening for peers  (default port: 7070)
+  -d              daemon mode: serve peers without an interactive REPL
   -h              show this help
+
+  MILTUX_PEERS=host[:port],host[:port],...
+                  auto-connect to these peers on startup
 ```
 
-Example — start as user `alice` and immediately listen for peers:
+Interactive — start as `alice`, listen, and auto-connect to known peers:
 
 ```sh
-build/miltux -u alice -l
+MILTUX_PEERS=bob-machine:7070,carol-machine:7070 \
+  build/miltux -u alice -l7070
 ```
 
-Or on a custom port:
+Daemon mode (as used in Docker containers):
 
 ```sh
-build/miltux -u alice -l 9090
+MILTUX_PEERS=node2:7070,node3:7070 \
+  build/miltux -u node1 -l7070 -d
 ```
 
 ---
@@ -210,11 +218,18 @@ src/
   ring.h   / ring.c     Ring protection (ring_ctx_t, ring_bracket_t)
   acl.h    / acl.c      Access Control Lists (acl_t, acl_entry_t)
   fs.h     / fs.c       Hierarchical file system (fs_t, fs_node_t)
-  net.h    / net.c      TCP peer mesh; simple line-based protocol (net_t, net_peer_t)
-  shell.h  / shell.c    Interactive command shell (shell_t)
+  net.h    / net.c      TCP peer mesh; gossip/auto-discovery; remote FS ops
+  shell.h  / shell.c    Interactive REPL + daemon mode (shell_t)
   main.c                Entry point, CLI argument parsing
 tests/
   test_miltux.c         28 unit + integration tests (no external deps)
+examples/
+  megacomputer/         7-node Docker Compose mega-computer cluster
+    Dockerfile          Two-stage Alpine build
+    docker-compose.yml  Seven services with shared bridge network
+    entrypoint.sh       Node startup script
+    demo.sh             Cross-node demo: write on one, read from another
+    README.md           Full documentation
 ```
 
 All modules are independent C compilation units with clear, minimal interfaces.

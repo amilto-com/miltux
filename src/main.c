@@ -5,7 +5,11 @@
  *   -u <identity>   run as the given identity (default: current POSIX user)
  *   -r <ring>       start at ring <ring> (default: 4 = user ring)
  *   -l [port]       listen for peer connections on port (default: 7070)
+ *   -d              daemon mode: serve peers without an interactive REPL
  *   -h              show usage
+ *
+ * Environment variables (read at startup):
+ *   MILTUX_PEERS    comma-separated "host" or "host:port" peers to connect to
  */
 
 #include "miltux.h"
@@ -21,11 +25,15 @@
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [-u <identity>] [-r <ring>] [-l [port]]\n"
+            "Usage: %s [-u <identity>] [-r <ring>] [-l [port]] [-d]\n"
             "  -u <identity>  run as identity (default: login name)\n"
             "  -r <ring>      start at ring 0-%d (default: %d)\n"
             "  -l [port]      listen for peers on port (default: %d)\n"
-            "  -h             show this help\n",
+            "  -d             daemon mode (no interactive REPL)\n"
+            "  -h             show this help\n"
+            "\n"
+            "  MILTUX_PEERS=host[:port],host[:port],...\n"
+            "               auto-connect to these peers on startup\n",
             prog, MILTUX_RING_MAX, MILTUX_RING_USER,
             MILTUX_NET_PORT_DEFAULT);
 }
@@ -52,13 +60,14 @@ static void get_default_identity(char *buf, size_t len)
 int main(int argc, char *argv[])
 {
     char identity[MILTUX_NAME_MAX + 1];
-    int  ring      = MILTUX_RING_USER;
-    int  listen_port = -1;   /* -1 = don't listen */
+    int  ring         = MILTUX_RING_USER;
+    int  listen_port  = -1;
+    int  daemon_mode  = 0;
     int  opt;
 
     get_default_identity(identity, sizeof(identity));
 
-    while ((opt = getopt(argc, argv, "u:r:l::h")) != -1) {
+    while ((opt = getopt(argc, argv, "u:r:l::dh")) != -1) {
         switch (opt) {
         case 'u':
             strncpy(identity, optarg, MILTUX_NAME_MAX);
@@ -79,7 +88,7 @@ int main(int argc, char *argv[])
             if (optarg) {
                 char *end;
                 long  p = strtol(optarg, &end, 10);
-                if (*end != '\0' || p < 1 || p > 65535) {
+                if (*end != '\0' || p < 0 || p > 65535) {
                     fprintf(stderr, "miltux: invalid port '%s'\n", optarg);
                     usage(argv[0]);
                     return EXIT_FAILURE;
@@ -88,6 +97,9 @@ int main(int argc, char *argv[])
             } else {
                 listen_port = MILTUX_NET_PORT_DEFAULT;
             }
+            break;
+        case 'd':
+            daemon_mode = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -119,7 +131,15 @@ int main(int argc, char *argv[])
         }
     }
 
-    shell_run(&sh);
+    /* Auto-connect to peers listed in MILTUX_PEERS env var */
+    net_autoconnect(&sh.net, identity);
+
+    if (daemon_mode) {
+        shell_run_daemon(&sh);
+    } else {
+        shell_run(&sh);
+    }
+
     shell_destroy(&sh);
     return EXIT_SUCCESS;
 }

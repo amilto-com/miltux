@@ -47,6 +47,15 @@ void shell_destroy(shell_t *sh);
 /* Run the interactive read-eval-print loop until EOF or "exit" */
 void shell_run(shell_t *sh);
 
+/*
+ * Run in daemon mode: no interactive REPL.  Loops forever serving peer
+ * requests and running the gossip protocol.  This is the mode used by
+ * Docker/container deployments — nodes expose their FS to the mesh and
+ * let remote peers read/write it via the protocol.
+ * Call net_listen() and net_autoconnect() before this function.
+ */
+void shell_run_daemon(shell_t *sh);
+
 /* Execute a single command line string (for testing / scripting) */
 miltux_err_t shell_exec(shell_t *sh, const char *line);
 

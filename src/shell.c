@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 #define MAX_ARGS 64
 #define LINE_MAX_LEN 4096
@@ -491,6 +492,34 @@ miltux_err_t shell_exec(shell_t *sh, const char *line)
     }
 
     return MILTUX_OK;
+}
+
+void shell_run_daemon(shell_t *sh)
+{
+    struct timespec ts;
+    int gossip_tick = 0;
+
+    if (!sh) return;
+
+    fprintf(stderr, "[miltux] daemon '%s' on port %d\n",
+            sh->identity, sh->net.port);
+    fflush(stderr);
+
+    /* Small fixed sleep between poll cycles (50 ms) */
+    ts.tv_sec  = 0;
+    ts.tv_nsec = 50000000L;
+
+    for (;;) {
+        net_poll(&sh->net, sh);
+
+        /* Run the gossip round every ~20 poll cycles (~1 s) */
+        if (++gossip_tick >= 20) {
+            net_gossip(&sh->net, sh->identity);
+            gossip_tick = 0;
+        }
+
+        nanosleep(&ts, NULL);
+    }
 }
 
 void shell_run(shell_t *sh)
