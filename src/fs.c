@@ -216,6 +216,12 @@ miltux_err_t fs_init(fs_t *fs)
     fs_mkdir(fs, ">system", "system", MILTUX_RING_SYSTEM);
     fs_mkdir(fs, ">user_dir_dir", "system", MILTUX_RING_SYSTEM);
 
+    /* >system>proc — Plan 9-style session introspection directory.
+     * Each active session registers a subdirectory here containing
+     * "status" and "peers" segments, readable by all users.
+     * Remote peers can inspect them via rls/rcat. */
+    fs_mkdir(fs, ">system>proc", "system", MILTUX_RING_SYSTEM);
+
     return MILTUX_OK;
 }
 

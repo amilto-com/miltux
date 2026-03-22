@@ -66,6 +66,12 @@ static void cmd_help(void)
         "  rmkdir  <node#> <path>   create directory on remote node\n"
         "  rwrite  <node#> <path> <text...>  write file on remote node\n"
         "\n"
+        "System introspection (Plan 9 /proc analog):\n"
+        "  proc                     list sessions in >system>proc>\n"
+        "  ls   >system>proc><id>   list a session's segments\n"
+        "  cat  >system>proc><id>>status   show session status\n"
+        "  cat  >system>proc><id>>peers    list connected peers\n"
+        "\n"
         "  help                     show this help\n"
         "  exit | quit              leave MiLTuX\n"
     );
@@ -227,6 +233,82 @@ static void cmd_acl(shell_t *sh, int argc, char *argv[])
     }
     printf("ACL for %s:\n", argv[1]);
     acl_print(&node->acl);
+}
+
+/* -----------------------------------------------------------------------
+ * Process filesystem — Plan 9 /proc/-style session introspection
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Refresh >system>proc><identity>>status and >system>proc><identity>>peers.
+ *
+ * status  — identity, ring, listen port, peer count (one key=value per line)
+ * peers   — one connected peer per line: "<identity> <host>:<port>"
+ *
+ * Called:
+ *   • shell_init()        — once at session start (creates the files)
+ *   • shell_run_daemon()  — on every gossip cycle (~1 s)
+ *   • shell_run()         — before each prompt (interactive mode)
+ *   • cmd_proc()          — just before listing >system>proc>
+ */
+static void shell_proc_refresh(shell_t *sh)
+{
+    char   path_status[MILTUX_PATH_MAX];
+    char   path_peers[MILTUX_PATH_MAX];
+    char   status_buf[256];
+    char   peers_buf[MILTUX_PEERS_MAX * 80 + 1]; /* ~80 chars/peer max */
+    size_t slen;
+    size_t plen;
+    int    peer_count;
+    int    i;
+    int    n;
+
+    snprintf(path_status, sizeof(path_status),
+             ">system>proc>%s>status", sh->identity);
+    snprintf(path_peers, sizeof(path_peers),
+             ">system>proc>%s>peers", sh->identity);
+
+    /* Count live peers */
+    peer_count = 0;
+    for (i = 0; i < sh->net.peer_count; i++)
+        if (sh->net.peers[i].fd >= 0)
+            peer_count++;
+
+    /* Write status segment */
+    slen = (size_t)snprintf(status_buf, sizeof(status_buf),
+        "identity=%s\nring=%d\nport=%d\npeers=%d\n",
+        sh->identity,
+        ring_current(&sh->ring_ctx),
+        (sh->net.listen_fd >= 0) ? sh->net.port : 0,
+        peer_count);
+    fs_write(&sh->fs, path_status, status_buf, slen,
+             "system", MILTUX_RING_SYSTEM);
+
+    /* Write peers segment (one line per connected peer) */
+    plen = 0;
+    for (i = 0; i < sh->net.peer_count; i++) {
+        if (sh->net.peers[i].fd < 0) continue;
+        n = snprintf(peers_buf + plen,
+                     sizeof(peers_buf) - plen,
+                     "%s %s:%d\n",
+                     sh->net.peers[i].identity,
+                     sh->net.peers[i].host,
+                     sh->net.peers[i].port);
+        if (n > 0) plen += (size_t)n;
+    }
+    fs_write(&sh->fs, path_peers, peers_buf, plen,
+             "system", MILTUX_RING_SYSTEM);
+}
+
+/* List all active sessions registered in >system>proc> */
+static void cmd_proc(shell_t *sh)
+{
+    shell_proc_refresh(sh);
+    miltux_err_t err = fs_list(&sh->fs, ">system>proc",
+                                sh->identity,
+                                ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "proc: %s\n", miltux_strerror(err));
 }
 
 /* -----------------------------------------------------------------------
@@ -413,6 +495,16 @@ miltux_err_t shell_init(shell_t *sh, const char *identity, int ring)
     /* cd into it */
     fs_chdir(&sh->fs, home, identity, ring);
 
+    /* Register this session in >system>proc> (Plan 9-style introspection).
+     * "status" and "peers" segments are created here and kept up to date
+     * by shell_proc_refresh() throughout the session lifetime. */
+    {
+        char proc_dir[MILTUX_PATH_MAX];
+        snprintf(proc_dir, sizeof(proc_dir), ">system>proc>%s", identity);
+        fs_mkdir(&sh->fs, proc_dir, "system", MILTUX_RING_SYSTEM);
+        shell_proc_refresh(sh); /* writes initial status + empty peers */
+    }
+
     return MILTUX_OK;
 }
 
@@ -485,6 +577,8 @@ miltux_err_t shell_exec(shell_t *sh, const char *line)
         cmd_rmkdir(sh, argc, argv);
     } else if (strcmp(cmd, "rwrite") == 0) {
         cmd_rwrite(sh, argc, argv);
+    } else if (strcmp(cmd, "proc") == 0) {
+        cmd_proc(sh);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         return MILTUX_ERR_RANGE; /* sentinel: caller checks for exit */
     } else {
@@ -515,6 +609,7 @@ void shell_run_daemon(shell_t *sh)
         /* Run the gossip round every ~20 poll cycles (~1 s) */
         if (++gossip_tick >= 20) {
             net_gossip(&sh->net, sh->identity);
+            shell_proc_refresh(sh); /* keep >system>proc> up to date */
             gossip_tick = 0;
         }
 
@@ -532,6 +627,9 @@ void shell_run(shell_t *sh)
     while (1) {
         /* Poll for incoming peer connections and requests (non-blocking) */
         net_poll(&sh->net, sh);
+
+        /* Keep >system>proc> current before every prompt */
+        shell_proc_refresh(sh);
 
         printf("miltux(%s:%d)%s> ",
                sh->identity,

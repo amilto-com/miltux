@@ -16,8 +16,13 @@
  *   su   <ring>                   - switch to a different ring
  *   whoami                        - show current identity
  *   pwd                           - print working directory
- *   help                          - show help
- *   exit / quit                   - leave MiLTuX
+ *   rls     <node#> <path>              - list directory on remote node
+ *   rcat    <node#> <path>              - read file from remote node
+ *   rmkdir  <node#> <path>              - make directory on remote node
+ *   rwrite  <node#> <path> <text...>    - write file on remote node
+ *   proc                                - list sessions in >system>proc>
+ *   help                                - show help
+ *   exit / quit                         - leave MiLTuX
  */
 
 #ifndef SHELL_H
