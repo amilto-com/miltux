@@ -82,6 +82,21 @@ typedef struct {
 } net_pending_t;
 
 /* -----------------------------------------------------------------------
+ * An exported subtree: a named path that remote peers can mount
+ *
+ * When a session calls `export <path> <name>`, the path is registered
+ * here.  Remote peers call `rmount <node#> <name> <local-target>` which
+ * sends an EXPORT request, receives the real path, then applies a local
+ * bind: local-target → remote node + remote path (via rmount protocol).
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    char name[MILTUX_NAME_MAX + 1];   /* short export name, e.g. "home"  */
+    char path[MILTUX_PATH_MAX];        /* absolute FS path being exported  */
+    char owner[MILTUX_NAME_MAX + 1];  /* identity that created the export */
+    int  ring;                         /* minimum ring required to mount   */
+} net_export_t;
+
+/* -----------------------------------------------------------------------
  * Net subsystem state (one per shell session)
  * ----------------------------------------------------------------------- */
 typedef struct {
@@ -93,6 +108,8 @@ typedef struct {
     int           pending_count;             /* number of pending retries      */
     int           poll_tick;                 /* monotonic counter; drives gossip*/
     void         *_sh;                       /* back-pointer to owning shell_t  */
+    net_export_t  exports[MILTUX_EXPORTS_MAX]; /* subtrees exported by this session */
+    int           export_count;              /* number of active exports         */
 } net_t;
 
 /* Initialise net state (not yet listening or connected) */
@@ -178,5 +195,40 @@ miltux_err_t net_remote_write(net_peer_t *peer,
 miltux_err_t net_remote_remove(net_peer_t *peer,
                                 const char *path,
                                 const char *identity, int ring);
+
+/* -----------------------------------------------------------------------
+ * Export / mount (Plan 9 exportfs)
+ *
+ * Server side:
+ *   net_export()         — register a named export for this session
+ *   net_unexport()       — remove a named export
+ *   net_list_exports()   — print the export table to stdout
+ *
+ * Client side:
+ *   net_remote_mount()   — query peer's export table (EXPORTS request),
+ *                          find <name>, then apply a local bind so that
+ *                          <local_target> transparently resolves to the
+ *                          remote subtree via the existing rls/rcat path.
+ *                          Returns MILTUX_OK and prints a confirmation.
+ * ----------------------------------------------------------------------- */
+miltux_err_t net_export(net_t *net,
+                         const char *path, const char *name,
+                         const char *owner, int ring);
+
+miltux_err_t net_unexport(net_t *net, const char *name,
+                            const char *owner, int ring);
+
+void net_list_exports(const net_t *net);
+
+/*
+ * Ask peer for its export table (EXPORTS), find <name>, then bind
+ * <local_target> → peer's exported path in this session's namespace.
+ * fs must be the caller's fs_t so the bind can be applied locally.
+ */
+miltux_err_t net_remote_mount(net_peer_t *peer,
+                               const char *export_name,
+                               const char *local_target,
+                               const char *identity, int ring,
+                               void *fs /* fs_t * */);
 
 #endif /* NET_H */

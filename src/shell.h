@@ -24,6 +24,10 @@
  *   bind   <source> <target>           - redirect target to source (Plan 9)
  *   unbind <target>                    - remove a bind
  *   binds                              - list all active binds
+ *   export  <path> <name>              - export local subtree under a name
+ *   unexport <name>                    - remove a named export
+ *   exports                            - list this node's exports
+ *   rmount  <node#> <name> <target>    - mount remote export at local target
  *   help                                - show help
  *   exit / quit                         - leave MiLTuX
  */

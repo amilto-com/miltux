@@ -9,6 +9,10 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/select.h>
 
 #define MAX_ARGS 64
 #define LINE_MAX_LEN 4096
@@ -76,6 +80,12 @@ static void cmd_help(void)
         "  bind   <source> <target>  redirect target → source in this session\n"
         "  unbind <target>           remove a bind from target\n"
         "  binds                     list all active binds\n"
+        "\n"
+        "Remote filesystem (Plan 9 exportfs):\n"
+        "  export  <path> <name>                export a local subtree under a name\n"
+        "  unexport <name>                      remove a named export\n"
+        "  exports                              list this node's exports\n"
+        "  rmount  <node#> <name> <target>      mount remote export at local target\n"
         "\n"
         "  help                     show this help\n"
         "  exit | quit              leave MiLTuX\n"
@@ -505,6 +515,66 @@ static void cmd_rwrite(shell_t *sh, int argc, char *argv[])
         fprintf(stderr, "rwrite: %s\n", miltux_strerror(err));
 }
 
+/* ----------------------------------------------------------------------- */
+/* Export / mount (Plan 9 exportfs)                                         */
+/* ----------------------------------------------------------------------- */
+
+static void cmd_export(shell_t *sh, int argc, char *argv[])
+{
+    /* export <path> <name> */
+    if (argc < 3) {
+        fprintf(stderr, "export: usage: export <path> <name>\n");
+        return;
+    }
+    miltux_err_t err = net_export(&sh->net, argv[1], argv[2],
+                                   sh->identity,
+                                   ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "export: %s\n", miltux_strerror(err));
+    else
+        printf("exported '%s' as '%s'\n", argv[1], argv[2]);
+}
+
+static void cmd_unexport(shell_t *sh, int argc, char *argv[])
+{
+    /* unexport <name> */
+    if (argc < 2) {
+        fprintf(stderr, "unexport: usage: unexport <name>\n");
+        return;
+    }
+    miltux_err_t err = net_unexport(&sh->net, argv[1],
+                                     sh->identity,
+                                     ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "unexport: %s\n", miltux_strerror(err));
+    else
+        printf("unexported '%s'\n", argv[1]);
+}
+
+static void cmd_exports(shell_t *sh)
+{
+    net_list_exports(&sh->net);
+}
+
+static void cmd_rmount(shell_t *sh, int argc, char *argv[])
+{
+    /* rmount <node#> <export-name> <local-target> */
+    if (argc < 4) {
+        fprintf(stderr, "rmount: usage: rmount <node#> <export-name> <local-target>\n");
+        return;
+    }
+    int idx = parse_node_idx(sh, argv[1]);
+    if (idx < 0) return;
+
+    miltux_err_t err = net_remote_mount(&sh->net.peers[idx],
+                                         argv[2], argv[3],
+                                         sh->identity,
+                                         ring_current(&sh->ring_ctx),
+                                         &sh->fs);
+    if (err != MILTUX_OK)
+        fprintf(stderr, "rmount: %s\n", miltux_strerror(err));
+}
+
 /* -----------------------------------------------------------------------
  * Public API
  * ----------------------------------------------------------------------- */
@@ -635,6 +705,14 @@ miltux_err_t shell_exec(shell_t *sh, const char *line)
         cmd_unbind(sh, argc, argv);
     } else if (strcmp(cmd, "binds") == 0) {
         cmd_binds(sh);
+    } else if (strcmp(cmd, "export") == 0) {
+        cmd_export(sh, argc, argv);
+    } else if (strcmp(cmd, "unexport") == 0) {
+        cmd_unexport(sh, argc, argv);
+    } else if (strcmp(cmd, "exports") == 0) {
+        cmd_exports(sh);
+    } else if (strcmp(cmd, "rmount") == 0) {
+        cmd_rmount(sh, argc, argv);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         return MILTUX_ERR_RANGE; /* sentinel: caller checks for exit */
     } else {
@@ -675,33 +753,129 @@ void shell_run_daemon(shell_t *sh)
 
 void shell_run(shell_t *sh)
 {
-    char line[LINE_MAX_LEN];
+    int stdin_fd = fileno(stdin);
 
     printf("MiLTuX — A Multics-inspired distributed system\n");
     printf("Type 'help' for a list of commands.\n\n");
 
+    /*
+     * Use raw read() on a non-blocking stdin so we can interleave
+     * net_poll() without the stdio buffer hiding already-read bytes from
+     * select().  Classic problem: fgets() may pull multiple lines into
+     * the stdio buffer in one syscall, leaving the raw fd "empty" from
+     * select's perspective even though data is already available.
+     */
+    int flags = fcntl(stdin_fd, F_GETFL, 0);
+    if (flags < 0) flags = 0;
+    fcntl(stdin_fd, F_SETFL, flags | O_NONBLOCK);
+
+    /* Line accumulator — survives across iterations */
+    static char ibuf[LINE_MAX_LEN * 4]; /* room for several queued lines */
+    static size_t ibuf_len = 0;
+
     while (1) {
-        /* Poll for incoming peer connections and requests (non-blocking) */
-        net_poll(&sh->net, sh);
-
-        /* Keep >system>proc> current before every prompt */
+        /* Print prompt */
         shell_proc_refresh(sh);
-
         printf("miltux(%s:%d)%s> ",
                sh->identity,
                ring_current(&sh->ring_ctx),
                sh->fs.cwd_path[0] ? sh->fs.cwd_path : ">");
         fflush(stdout);
 
-        if (!fgets(line, sizeof(line), stdin)) {
+        /*
+         * Inner loop: fill ibuf until we have a complete line (or EOF),
+         * calling net_poll() whenever stdin has no new data.
+         */
+        int got_line = 0;
+        int got_eof  = 0;
+
+        while (!got_line && !got_eof) {
+            /* ── 1. Check if ibuf already contains a full line ── */
+            char *nl = (char *)memchr(ibuf, '\n', ibuf_len);
+            if (nl) { got_line = 1; break; }
+
+            /* ── 2. Try to read more bytes from stdin (non-blocking) ── */
+            size_t space = sizeof(ibuf) - ibuf_len - 1;
+            if (space > 0) {
+                ssize_t n = read(stdin_fd, ibuf + ibuf_len, space);
+                if (n > 0) {
+                    ibuf_len += (size_t)n;
+                    continue; /* check for '\n' at top of loop */
+                } else if (n == 0) {
+                    got_eof = 1;
+                    break;
+                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    got_eof = 1;
+                    break;
+                }
+                /* EAGAIN: fd not ready → fall through to select/net_poll */
+            }
+
+            /* ── 3. stdin not ready: poll network, then wait ── */
+            net_poll(&sh->net, sh);
+
+            fd_set rfds;
+            struct timeval tv;
+            int maxfd = stdin_fd;
+
+            FD_ZERO(&rfds);
+            FD_SET(stdin_fd, &rfds);
+
+            if (sh->net.listen_fd >= 0) {
+                FD_SET(sh->net.listen_fd, &rfds);
+                if (sh->net.listen_fd > maxfd) maxfd = sh->net.listen_fd;
+            }
+            for (int i = 0; i < sh->net.peer_count; i++) {
+                int pfd = sh->net.peers[i].fd;
+                if (pfd >= 0) {
+                    FD_SET(pfd, &rfds);
+                    if (pfd > maxfd) maxfd = pfd;
+                }
+            }
+
+            tv.tv_sec  = 0;
+            tv.tv_usec = 50000; /* 50 ms — tighter loop */
+
+            select(maxfd + 1, &rfds, NULL, NULL, &tv);
+            /* result intentionally ignored: we retry the read regardless */
+        }
+
+        if (got_eof && ibuf_len == 0) {
             printf("\n");
             break;
         }
 
+        /* ── Extract one line from ibuf ── */
+        char line[LINE_MAX_LEN];
+        char *nl = (char *)memchr(ibuf, '\n', ibuf_len);
+        size_t line_len;
+
+        if (nl) {
+            line_len = (size_t)(nl - ibuf); /* bytes before '\n' */
+        } else {
+            line_len = ibuf_len; /* EOF without trailing newline */
+        }
+
+        if (line_len >= LINE_MAX_LEN - 1)
+            line_len = LINE_MAX_LEN - 2;
+
+        memcpy(line, ibuf, line_len);
+        line[line_len]     = '\n';
+        line[line_len + 1] = '\0';
+
+        /* Consume extracted bytes (+ '\n' if present) from ibuf */
+        size_t consumed = line_len + (nl ? 1 : 0);
+        ibuf_len -= consumed;
+        if (ibuf_len > 0)
+            memmove(ibuf, ibuf + consumed, ibuf_len);
+
         miltux_err_t err = shell_exec(sh, line);
-        if (err == MILTUX_ERR_RANGE) /* exit sentinel */
+        if (err == MILTUX_ERR_RANGE) /* "exit" sentinel */
             break;
     }
+
+    /* Restore stdin flags */
+    fcntl(stdin_fd, F_SETFL, flags & ~O_NONBLOCK);
 
     printf("Farewell from MiLTuX.\n");
 }

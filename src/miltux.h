@@ -38,6 +38,7 @@
 #define MILTUX_FILE_MAX     65536   /* max bytes per file           */
 #define MILTUX_USERS_MAX    64      /* max users in the system      */
 #define MILTUX_BIND_DEPTH_MAX 8     /* max bind chain depth (cycle guard) */
+#define MILTUX_EXPORTS_MAX    16    /* max exported subtrees per node     */
 
 /* -----------------------------------------------------------------------
  * Error codes
@@ -53,6 +54,7 @@ typedef enum {
     MILTUX_ERR_ISDIR = -7,   /* is a directory                            */
     MILTUX_ERR_NOTEMPTY = -8,/* directory not empty                       */
     MILTUX_ERR_RANGE = -9,   /* value out of range                        */
+    MILTUX_ERR_NET   = -10,  /* network / protocol error                  */
 } miltux_err_t;
 
 const char *miltux_strerror(miltux_err_t err);

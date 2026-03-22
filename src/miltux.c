@@ -17,6 +17,7 @@ const char *miltux_strerror(miltux_err_t err)
     case MILTUX_ERR_ISDIR:    return "is a directory";
     case MILTUX_ERR_NOTEMPTY: return "directory not empty";
     case MILTUX_ERR_RANGE:    return "value out of range";
+    case MILTUX_ERR_NET:      return "network error";
     default:                  return "unknown error";
     }
 }

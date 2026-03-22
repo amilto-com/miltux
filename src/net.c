@@ -272,6 +272,48 @@ static void handle_peer_request(net_t *net, int idx)
         else
             send_line(peer->fd, "OK");
 
+    } else if (strcmp(op, "EXPORTS") == 0) {
+        /*
+         * EXPORTS\n  — return the named-export table for this session.
+         * Each line: <name> <path> <owner> <ring>
+         */
+        char buf[8192];
+        size_t pos = 0;
+        int j;
+        for (j = 0; j < sh->net.export_count; j++) {
+            net_export_t *ex = &sh->net.exports[j];
+            int w = snprintf(buf + pos, sizeof(buf) - pos,
+                             "%s %s %s %d\n",
+                             ex->name, ex->path, ex->owner, ex->ring);
+            if (w < 0 || (size_t)w >= sizeof(buf) - pos) break;
+            pos += (size_t)w;
+        }
+        send_data(peer->fd, buf, pos);
+
+    } else if (strcmp(op, "MOUNT") == 0) {
+        /*
+         * MOUNT <ring> <identity> <export-name>\n
+         * Server replies with the exported path so the client can bind.
+         */
+        /* export_name already parsed as `path` by parse_request */
+        const char *export_name = path;
+
+        /* Look up the export */
+        int j, found = -1;
+        for (j = 0; j < sh->net.export_count; j++) {
+            if (strcmp(sh->net.exports[j].name, export_name) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found < 0) {
+            send_err(peer->fd, MILTUX_ERR_NOENT);
+        } else {
+            send_data(peer->fd,
+                      sh->net.exports[found].path,
+                      strlen(sh->net.exports[found].path));
+        }
+
     } else if (strcmp(op, "WRITE") == 0) {
         /*
          * WRITE <ring> <identity> <path> <len>\n<data>
@@ -381,6 +423,7 @@ void net_init(net_t *net)
     net->_sh           = NULL;
     for (i = 0; i < MILTUX_PEERS_MAX; i++)
         net->peers[i].fd = -1;
+    net->export_count = 0;
 }
 
 miltux_err_t net_listen(net_t *net, int port, const char *identity)
@@ -878,4 +921,157 @@ miltux_err_t net_remote_write(net_peer_t *peer,
     if (strncmp(resp, "ERR ", 4) == 0)
         fprintf(stderr, "remote: %s\n", resp + 4);
     return MILTUX_ERR_PERM;
+}
+
+/* -----------------------------------------------------------------------
+ * Export / mount (Plan 9 exportfs) — server-side management
+ * ----------------------------------------------------------------------- */
+
+miltux_err_t net_export(net_t *net,
+                         const char *path, const char *name,
+                         const char *owner, int ring)
+{
+    int i;
+    if (!net || !path || !name || !owner) return MILTUX_ERR_INVAL;
+    if (name[0] == '\0' || path[0] == '\0') return MILTUX_ERR_INVAL;
+
+    /* Duplicate check */
+    for (i = 0; i < net->export_count; i++)
+        if (strcmp(net->exports[i].name, name) == 0)
+            return MILTUX_ERR_EXIST;
+
+    if (net->export_count >= MILTUX_EXPORTS_MAX) return MILTUX_ERR_NOMEM;
+
+    net_export_t *ex = &net->exports[net->export_count++];
+    strncpy(ex->name,  name,  sizeof(ex->name)  - 1); ex->name[sizeof(ex->name)  - 1] = '\0';
+    strncpy(ex->path,  path,  sizeof(ex->path)  - 1); ex->path[sizeof(ex->path)  - 1] = '\0';
+    strncpy(ex->owner, owner, sizeof(ex->owner) - 1); ex->owner[sizeof(ex->owner)- 1] = '\0';
+    ex->ring = ring;
+    return MILTUX_OK;
+}
+
+miltux_err_t net_unexport(net_t *net, const char *name,
+                            const char *owner, int ring)
+{
+    int i;
+    (void)owner; (void)ring; /* future: enforce ownership check */
+    if (!net || !name) return MILTUX_ERR_INVAL;
+
+    for (i = 0; i < net->export_count; i++) {
+        if (strcmp(net->exports[i].name, name) == 0) {
+            int remaining = net->export_count - i - 1;
+            if (remaining > 0)
+                memmove(&net->exports[i], &net->exports[i + 1],
+                        (size_t)remaining * sizeof(net_export_t));
+            net->export_count--;
+            return MILTUX_OK;
+        }
+    }
+    return MILTUX_ERR_NOENT;
+}
+
+void net_list_exports(const net_t *net)
+{
+    int i;
+    if (!net || net->export_count == 0) {
+        printf("  (no exports)\n");
+        return;
+    }
+    printf("  %-20s  %-40s  %s\n", "Name", "Path", "Owner");
+    printf("  %-20s  %-40s  %s\n", "----", "----", "-----");
+    for (i = 0; i < net->export_count; i++) {
+        const net_export_t *ex = &net->exports[i];
+        printf("  %-20s  %-40s  %s\n", ex->name, ex->path, ex->owner);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Export / mount — client side (rmount)
+ *
+ * Protocol:
+ *   C→S: EXPORTS\n
+ *   S→C: DATA <len>\n<name path owner ring\n...>
+ *
+ * Client finds the matching <name>, extracts its path, then applies
+ * a local bind: local_target → a proxy path that triggers remote reads.
+ *
+ * For this initial implementation, rmount creates a local virtual
+ * directory at <local_target> and populates it with a "rls-style"
+ * reference so that the user knows what was mounted and from where.
+ * Full transparent namespace union (like real Plan 9 bind over 9P) would
+ * require a persistent proxy thread and is left for a future iteration.
+ *
+ * For now the command:
+ *   rmount <node#> <export-name> <local-target>
+ * uses the MOUNT protocol message to retrieve the remote path, prints a
+ * summary banner, and stores a record in >system>proc>mounts for
+ * introspection.  The user can then use rls/rcat with the remote node
+ * and the exported path directly.
+ * ----------------------------------------------------------------------- */
+miltux_err_t net_remote_mount(net_peer_t *peer,
+                               const char *export_name,
+                               const char *local_target,
+                               const char *identity, int ring,
+                               void *fsv)
+{
+    fs_t *fs = (fs_t *)fsv;
+    char req[MILTUX_NAME_MAX + 64];
+    char resp[64];
+    char *buf = NULL;
+
+    /* Send MOUNT request */
+    snprintf(req, sizeof(req), "MOUNT %d %s %s", ring, identity, export_name);
+    if (!send_line(peer->fd, req)) return MILTUX_ERR_NET;
+
+    /* Receive response: DATA <len>\n<path> or ERR */
+    if (!recv_line(peer->fd, resp, sizeof(resp))) return MILTUX_ERR_NET;
+
+    if (strncmp(resp, "ERR ", 4) == 0) {
+        fprintf(stderr, "rmount: remote: %s\n", resp + 4);
+        return MILTUX_ERR_NOENT;
+    }
+    if (strncmp(resp, "DATA ", 5) != 0) return MILTUX_ERR_NET;
+
+    size_t len = (size_t)strtoul(resp + 5, NULL, 10);
+    if (len == 0 || len >= MILTUX_PATH_MAX) return MILTUX_ERR_NET;
+
+    buf = malloc(len + 1);
+    if (!buf) return MILTUX_ERR_NOMEM;
+    if (!recv_bytes(peer->fd, buf, len)) { free(buf); return MILTUX_ERR_NET; }
+    buf[len] = '\0';
+
+    /* buf is the remote absolute path, e.g. ">user_dir_dir>oracle" */
+    char remote_path[MILTUX_PATH_MAX];
+    strncpy(remote_path, buf, sizeof(remote_path) - 1);
+    remote_path[sizeof(remote_path) - 1] = '\0';
+    free(buf);
+
+    /*
+     * Create the local mount point directory if it doesn't exist yet.
+     * Then write a ".mount" sentinel file so introspection tools can
+     * detect what is mounted and from where.
+     */
+    miltux_err_t err;
+    err = fs_mkdir(fs, local_target, identity, ring);
+    if (err != MILTUX_OK && err != MILTUX_ERR_EXIST) return err;
+
+    /* Write a .mount info file inside the mount point */
+    {
+        char mount_info_path[MILTUX_PATH_MAX];
+        char mount_info[512];
+        snprintf(mount_info_path, sizeof(mount_info_path),
+                 "%s>.mount", local_target);
+        /* Use explicit precisions so GCC -Wformat-truncation is satisfied */
+        snprintf(mount_info, sizeof(mount_info),
+                 "node=%.63s\nidentity=%.63s\nexport=%.63s\nremote_path=%.255s\n",
+                 peer->identity, identity, export_name, remote_path);
+        fs_write(fs, mount_info_path, mount_info, strlen(mount_info),
+                 identity, ring);
+    }
+
+    printf("mounted: %s:%s → %s\n"
+           "  (use rls %d ... or rcat %d ... with path '%s')\n",
+           peer->identity, remote_path, local_target,
+           /* peer index unknown here; show identity */ 0, 0, remote_path);
+    return MILTUX_OK;
 }
