@@ -78,6 +78,16 @@ static miltux_err_t dir_remove_child(fs_node_t *dir, fs_node_t *child)
  * ">".  We support both ">" and "/" for convenience.
  * ----------------------------------------------------------------------- */
 
+/* Follow a bind chain with cycle protection.
+ * Returns the ultimate target node (may be the same node if unbound). */
+static fs_node_t *follow_bind(fs_node_t *n)
+{
+    int depth = 0;
+    while (n && n->bound_to && depth++ < MILTUX_BIND_DEPTH_MAX)
+        n = n->bound_to;
+    return n;
+}
+
 /* Split path into the first component and the rest.
  * e.g. "foo>bar>baz" -> component="foo", rest="bar>baz"
  *      ">foo>bar"    -> component="" (root), rest="foo>bar"
@@ -153,7 +163,8 @@ fs_node_t *fs_resolve(fs_t *fs, const char *path, miltux_err_t *err)
             if (err) *err = MILTUX_ERR_NOENT;
             return NULL;
         }
-        cur = child;
+        /* Transparently follow any bind mounted on this node */
+        cur = follow_bind(child);
         p   = rest;
     }
 
@@ -453,7 +464,13 @@ miltux_err_t fs_list(fs_t *fs, const char *path,
     if (err != MILTUX_OK) return err;
 
     for (i = 0; i < node->child_count; i++) {
-        fs_node_t *child = node->children[i];
+        fs_node_t  *child = node->children[i];
+        const char *suffix;
+        /* Show "@" for bound nodes (like Unix shows "l" for symlinks) */
+        if (child->bound_to)
+            suffix = (child->type == FS_NODE_DIR) ? ">@" : "@";
+        else
+            suffix = (child->type == FS_NODE_DIR) ? ">" : "";
         /* Show effective permissions for this accessor */
         int eff = ACL_PERM_NONE;
         if (acl_check(&child->acl, accessor, ring, ACL_PERM_READ)  == MILTUX_OK)
@@ -466,10 +483,7 @@ miltux_err_t fs_list(fs_t *fs, const char *path,
             eff |= ACL_PERM_APPEND;
 
         acl_perm_str(eff, pstr);
-        printf("  %s  %s%s\n",
-               pstr,
-               child->name,
-               child->type == FS_NODE_DIR ? ">" : "");
+        printf("  %s  %s%s\n", pstr, child->name, suffix);
     }
     if (node->child_count == 0)
         printf("  (empty)\n");
@@ -498,7 +512,12 @@ int fs_list_buf(fs_t *fs, const char *path,
     if (err != MILTUX_OK) return -1;
 
     for (i = 0; i < node->child_count; i++) {
-        fs_node_t *child = node->children[i];
+        fs_node_t  *child = node->children[i];
+        const char *suffix;
+        if (child->bound_to)
+            suffix = (child->type == FS_NODE_DIR) ? ">@" : "@";
+        else
+            suffix = (child->type == FS_NODE_DIR) ? ">" : "";
         int eff = ACL_PERM_NONE;
         if (acl_check(&child->acl, accessor, ring, ACL_PERM_READ)  == MILTUX_OK)
             eff |= ACL_PERM_READ;
@@ -511,8 +530,7 @@ int fs_list_buf(fs_t *fs, const char *path,
 
         acl_perm_str(eff, pstr);
         int written = snprintf(buf + pos, bufsz - pos, "  %s  %s%s\n",
-                               pstr, child->name,
-                               child->type == FS_NODE_DIR ? ">" : "");
+                               pstr, child->name, suffix);
         if (written < 0 || (size_t)written >= bufsz - pos) break;
         pos += (size_t)written;
     }
@@ -528,4 +546,107 @@ int fs_list_buf(fs_t *fs, const char *path,
 
     buf[pos] = '\0';
     return (int)pos;
+}
+
+/* -----------------------------------------------------------------------
+ * Bind — Plan 9-style per-session namespace
+ * ----------------------------------------------------------------------- */
+
+/*
+ * fs_bind(source, target): transparently redirect target → source.
+ *
+ * After binding, any path resolution that reaches target will silently
+ * continue from source instead.  Both nodes must be of the same type
+ * (both dirs or both files).  The caller needs exec on source and write
+ * on target.  Chains of up to MILTUX_BIND_DEPTH_MAX are followed;
+ * deeper chains are silently truncated (cycle protection).
+ */
+miltux_err_t fs_bind(fs_t *fs, const char *source, const char *target,
+                     const char *accessor, int ring)
+{
+    miltux_err_t  err;
+    fs_node_t    *src_node;
+    fs_node_t    *tgt_parent;
+    fs_node_t    *tgt_node;
+    char          tgt_base[MILTUX_NAME_MAX + 1];
+
+    if (!fs || !source || !target || !accessor) return MILTUX_ERR_INVAL;
+    if (strcmp(source, target) == 0)            return MILTUX_ERR_INVAL;
+
+    src_node = fs_resolve(fs, source, &err);
+    if (!src_node) return err;
+
+    /* Resolve the target without following its own bind (so we can set it).
+     * We navigate to the parent and find the child directly. */
+    tgt_parent = resolve_parent(fs, target, tgt_base, sizeof(tgt_base), &err);
+    if (!tgt_parent) return err;
+    tgt_node = dir_find_child(tgt_parent, tgt_base);
+    if (!tgt_node) return MILTUX_ERR_NOENT;
+
+    /* Types must match */
+    if (src_node->type != tgt_node->type) return MILTUX_ERR_INVAL;
+
+    /* Permissions: exec on source (to enter/read), write on target (to rebind) */
+    err = acl_check(&src_node->acl, accessor, ring, ACL_PERM_EXEC);
+    if (err != MILTUX_OK) return err;
+    err = acl_check(&tgt_node->acl, accessor, ring, ACL_PERM_WRITE);
+    if (err != MILTUX_OK) return err;
+
+    tgt_node->bound_to = src_node;
+    return MILTUX_OK;
+}
+
+/*
+ * fs_unbind(target): remove the bind from target.
+ *
+ * Resolves target WITHOUT following its bind (so you always unbind the
+ * node you name, not the node it points to).
+ */
+miltux_err_t fs_unbind(fs_t *fs, const char *target,
+                        const char *accessor, int ring)
+{
+    miltux_err_t  err;
+    fs_node_t    *tgt_parent;
+    fs_node_t    *tgt_node;
+    char          tgt_base[MILTUX_NAME_MAX + 1];
+
+    if (!fs || !target || !accessor) return MILTUX_ERR_INVAL;
+
+    tgt_parent = resolve_parent(fs, target, tgt_base, sizeof(tgt_base), &err);
+    if (!tgt_parent) return err;
+    tgt_node = dir_find_child(tgt_parent, tgt_base);
+    if (!tgt_node)        return MILTUX_ERR_NOENT;
+    if (!tgt_node->bound_to) return MILTUX_ERR_INVAL; /* not bound */
+
+    err = acl_check(&tgt_node->acl, accessor, ring, ACL_PERM_WRITE);
+    if (err != MILTUX_OK) return err;
+
+    tgt_node->bound_to = NULL;
+    return MILTUX_OK;
+}
+
+/* Recursive helper for fs_list_binds */
+static void list_binds_rec(const fs_node_t *node, int depth)
+{
+    char src[MILTUX_PATH_MAX];
+    char tgt[MILTUX_PATH_MAX];
+    int  i;
+
+    if (!node || depth > 32) return;
+    if (node->bound_to) {
+        fs_node_path(node,           tgt, sizeof(tgt));
+        fs_node_path(node->bound_to, src, sizeof(src));
+        printf("  %s  →  %s\n", tgt, src);
+    }
+    if (node->type == FS_NODE_DIR) {
+        for (i = 0; i < node->child_count; i++)
+            list_binds_rec(node->children[i], depth + 1);
+    }
+}
+
+/* Print all active binds in this session's namespace. */
+void fs_list_binds(fs_t *fs)
+{
+    if (!fs || !fs->root) return;
+    list_binds_rec(fs->root, 0);
 }

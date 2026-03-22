@@ -72,6 +72,11 @@ static void cmd_help(void)
         "  cat  >system>proc><id>>status   show session status\n"
         "  cat  >system>proc><id>>peers    list connected peers\n"
         "\n"
+        "Namespace (Plan 9 bind):\n"
+        "  bind   <source> <target>  redirect target → source in this session\n"
+        "  unbind <target>           remove a bind from target\n"
+        "  binds                     list all active binds\n"
+        "\n"
         "  help                     show this help\n"
         "  exit | quit              leave MiLTuX\n"
     );
@@ -233,6 +238,41 @@ static void cmd_acl(shell_t *sh, int argc, char *argv[])
     }
     printf("ACL for %s:\n", argv[1]);
     acl_print(&node->acl);
+}
+
+/* -----------------------------------------------------------------------
+ * Namespace commands — Plan 9 bind
+ * ----------------------------------------------------------------------- */
+
+static void cmd_bind(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 3) {
+        fprintf(stderr, "bind: usage: bind <source> <target>\n");
+        return;
+    }
+    miltux_err_t err = fs_bind(&sh->fs, argv[1], argv[2],
+                                sh->identity,
+                                ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "bind: %s\n", miltux_strerror(err));
+}
+
+static void cmd_unbind(shell_t *sh, int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "unbind: usage: unbind <target>\n");
+        return;
+    }
+    miltux_err_t err = fs_unbind(&sh->fs, argv[1],
+                                  sh->identity,
+                                  ring_current(&sh->ring_ctx));
+    if (err != MILTUX_OK)
+        fprintf(stderr, "unbind: %s\n", miltux_strerror(err));
+}
+
+static void cmd_binds(shell_t *sh)
+{
+    fs_list_binds(&sh->fs);
 }
 
 /* -----------------------------------------------------------------------
@@ -487,13 +527,23 @@ miltux_err_t shell_init(shell_t *sh, const char *identity, int ring)
     strncpy(sh->identity, identity, MILTUX_NAME_MAX);
     sh->identity[MILTUX_NAME_MAX] = '\0';
 
-    /* Create a home directory for the user */
+    /* Create a home directory for the user.
+     * >user_dir_dir is owned by "system", so we create the subdir with
+     * system credentials, then immediately grant the actual identity full
+     * access to their own home directory. */
     char home[MILTUX_PATH_MAX];
     snprintf(home, sizeof(home), ">user_dir_dir>%s", identity);
-    fs_mkdir(&sh->fs, home, identity, ring);
+    err = fs_mkdir(&sh->fs, home, "system", MILTUX_RING_SYSTEM);
+    if (err == MILTUX_OK || err == MILTUX_ERR_EXIST) {
+        /* Give the user full ownership of their home dir */
+        miltux_err_t home_err;
+        fs_node_t *home_node = fs_resolve(&sh->fs, home, &home_err);
+        if (home_node)
+            acl_set(&home_node->acl, identity, ACL_PERM_ALL, MILTUX_RING_MAX);
+    }
 
     /* cd into it */
-    fs_chdir(&sh->fs, home, identity, ring);
+    err = fs_chdir(&sh->fs, home, identity, ring);
 
     /* Register this session in >system>proc> (Plan 9-style introspection).
      * "status" and "peers" segments are created here and kept up to date
@@ -579,6 +629,12 @@ miltux_err_t shell_exec(shell_t *sh, const char *line)
         cmd_rwrite(sh, argc, argv);
     } else if (strcmp(cmd, "proc") == 0) {
         cmd_proc(sh);
+    } else if (strcmp(cmd, "bind") == 0) {
+        cmd_bind(sh, argc, argv);
+    } else if (strcmp(cmd, "unbind") == 0) {
+        cmd_unbind(sh, argc, argv);
+    } else if (strcmp(cmd, "binds") == 0) {
+        cmd_binds(sh);
     } else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
         return MILTUX_ERR_RANGE; /* sentinel: caller checks for exit */
     } else {

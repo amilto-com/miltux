@@ -43,6 +43,12 @@ typedef struct fs_node {
 
     /* Parent pointer (NULL for root) */
     struct fs_node *parent;
+
+    /* Bind point (Plan 9 "bind"): if non-NULL, any path resolution that
+     * reaches this node is transparently redirected to bound_to.
+     * This gives each session its own private namespace view without
+     * affecting the global tree.  ls shows bound nodes with a "@" suffix. */
+    struct fs_node *bound_to;
 } fs_node_t;
 
 /* -----------------------------------------------------------------------
@@ -107,5 +113,25 @@ miltux_err_t fs_list(fs_t *fs, const char *path,
 int fs_list_buf(fs_t *fs, const char *path,
                 const char *accessor, int ring,
                 char *buf, size_t bufsz);
+
+/* -----------------------------------------------------------------------
+ * Bind (Plan 9-style per-session namespace)
+ *
+ * bind source target — transparently redirect "target" to "source".
+ *   Both paths must exist and have the same type (dir/file).
+ *   Accessing target subsequently resolves to source's subtree.
+ *   ls shows bound nodes with a "@" suffix (like Unix symlinks).
+ *
+ * unbind target      — remove the binding from target.
+ *
+ * fs_list_binds      — print all active binds in this session's namespace.
+ * ----------------------------------------------------------------------- */
+miltux_err_t fs_bind(fs_t *fs, const char *source, const char *target,
+                     const char *accessor, int ring);
+
+miltux_err_t fs_unbind(fs_t *fs, const char *target,
+                        const char *accessor, int ring);
+
+void fs_list_binds(fs_t *fs);
 
 #endif /* FS_H */

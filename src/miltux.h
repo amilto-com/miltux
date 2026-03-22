@@ -37,6 +37,7 @@
 #define MILTUX_CHILDREN_MAX 256     /* max children in a directory  */
 #define MILTUX_FILE_MAX     65536   /* max bytes per file           */
 #define MILTUX_USERS_MAX    64      /* max users in the system      */
+#define MILTUX_BIND_DEPTH_MAX 8     /* max bind chain depth (cycle guard) */
 
 /* -----------------------------------------------------------------------
  * Error codes

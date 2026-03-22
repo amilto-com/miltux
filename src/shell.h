@@ -21,6 +21,9 @@
  *   rmkdir  <node#> <path>              - make directory on remote node
  *   rwrite  <node#> <path> <text...>    - write file on remote node
  *   proc                                - list sessions in >system>proc>
+ *   bind   <source> <target>           - redirect target to source (Plan 9)
+ *   unbind <target>                    - remove a bind
+ *   binds                              - list all active binds
  *   help                                - show help
  *   exit / quit                         - leave MiLTuX
  */
